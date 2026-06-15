@@ -6,11 +6,12 @@ Dieses Tool erstellt einen englischen Klon eines bestehenden Miro-Boards und üb
 
 Das Script:
 
-1. kopiert ein bestehendes Miro-Board,
-2. liest alle unterstützten Board-Items aus der Kopie,
-3. prüft Schreibrechte auf der Kopie,
-4. übersetzt gefundene Texte lokal nach Englisch,
-5. schreibt die übersetzten Texte zurück in den geklonten Board.
+1. prüft das lokale CTranslate2-Backend inklusive CUDA, falls `--ct2-device cuda` gesetzt ist,
+2. kopiert ein bestehendes Miro-Board,
+3. liest alle unterstützten Board-Items aus der Kopie,
+4. prüft Schreibrechte auf der Kopie,
+5. übersetzt gefundene Texte lokal nach Englisch,
+6. schreibt die übersetzten Texte zurück in den geklonten Board.
 
 Das Original-Board bleibt unverändert.
 
@@ -106,6 +107,11 @@ lokalen Übersetzung mit einem temporären Test-Shape. Erst wenn Erstellen,
 Aktualisieren und Löschen dieses Test-Elements funktionieren, startet die
 Übersetzung.
 
+Das lokale Übersetzungsbackend wird noch früher geprüft: Vor dem Miro-Clone lädt
+das Script das CTranslate2-Modell und führt eine Mini-Übersetzung aus. Bei
+fehlendem Modell, fehlenden Python-Paketen oder fehlenden CUDA-DLLs bricht der
+Lauf dadurch ab, ohne einen neuen Miro-Clone zu erzeugen.
+
 Optional kann mit `--target-team-id` gesteuert werden, in welchem Miro-Team der
 geklonte Board erstellt wird. Der Token-Nutzer und die Miro-App müssen auch in
 diesem Ziel-Team die nötigen Rechte haben. Ohne `--target-team-id` entscheidet
@@ -183,6 +189,26 @@ python main.py `
   --ct2-compute-type "int8" `
   --translation-batch-size 32
 ```
+
+Wenn der Fehler `cublas64_12.dll is not found or cannot be loaded` erscheint,
+ist zwar der NVIDIA-Treiber vorhanden, aber CTranslate2 findet die CUDA-12
+Runtime-Bibliotheken nicht. Installiere das NVIDIA CUDA Toolkit 12.x und stelle
+sicher, dass der `bin`-Ordner im `PATH` liegt, z. B.:
+
+```text
+C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.x\bin
+```
+
+In einer neuen PowerShell sollte danach `where cublas64_12.dll` einen Pfad in
+diesem CUDA-Ordner ausgeben. Ohne CUDA Toolkit kann die CPU-Variante genutzt
+werden.
+
+Wenn CUDA installiert ist, aber `where cublas64_12.dll` nichts findet, wurde der
+CUDA-`bin`-Ordner noch nicht in die aktuelle Umgebung übernommen. Eine neue
+PowerShell oder ein Neustart von PyCharm reicht oft aus. Das Script versucht
+zusätzlich, typische CUDA-12-Installationen wie
+`C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9\bin` automatisch für
+die DLL-Suche zu registrieren.
 
 ### Testlauf ohne finale Miro-Updates
 

@@ -29,6 +29,15 @@ PYTHON_DEPENDENCIES_COMMAND = (
     "pip install ctranslate2 transformers sentencepiece sacremoses beautifulsoup4 "
     "requests python-dotenv"
 )
+CUDA_DLL_HELP = (
+    "CTranslate2 could not load the CUDA runtime library 'cublas64_12.dll'. "
+    "Install the NVIDIA CUDA Toolkit 12.x and make sure its 'bin' directory is "
+    "available in PATH, for example "
+    "'C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.x\\bin'. "
+    "If CUDA is installed but started from PyCharm or another shell, restart the "
+    "application so it picks up the updated PATH. "
+    "As a fallback, run with --ct2-device cpu --ct2-compute-type int8."
+)
 TRANSLATION_CACHE_SAVE_INTERVAL = 500
 
 # Item type -> endpoint segment
@@ -270,6 +279,22 @@ class Ct2TranslatorBackend:
     batch_size: int
 
 
+def create_ct2_backend(args: argparse.Namespace) -> Ct2TranslatorBackend:
+    translator, tokenizer = create_ct2_translator(
+        ct2_model_dir=args.ct2_model_dir,
+        tokenizer_model=args.hf_tokenizer_model,
+        device=args.ct2_device,
+        compute_type=args.ct2_compute_type,
+    )
+    return Ct2TranslatorBackend(
+        translator=translator,
+        tokenizer=tokenizer,
+        tokenizer_model=args.hf_tokenizer_model,
+        ct2_model_dir=args.ct2_model_dir,
+        batch_size=args.translation_batch_size,
+    )
+
+
 @dataclass
 class TranslationStats:
     cached_translations_used: int = 0
@@ -357,6 +382,9 @@ def create_ct2_translator(
             f"  {CT2_CONVERSION_COMMAND}"
         )
 
+    if device.lower() == "cuda":
+        configure_cuda_dll_search_path()
+
     try:
         import ctranslate2
     except ModuleNotFoundError as exc:
@@ -388,13 +416,57 @@ def create_ct2_translator(
             "directory."
         ) from exc
 
-    translator = ctranslate2.Translator(
-        str(model_path),
-        device=device,
-        compute_type=compute_type,
-    )
+    try:
+        translator = ctranslate2.Translator(
+            str(model_path),
+            device=device,
+            compute_type=compute_type,
+        )
+    except RuntimeError as exc:
+        if is_cuda_runtime_load_error(exc):
+            raise RuntimeError(CUDA_DLL_HELP) from exc
+        raise
 
     return translator, tokenizer
+
+
+def configure_cuda_dll_search_path() -> None:
+    cuda_bin_dir = find_cuda_bin_dir()
+    if not cuda_bin_dir:
+        return
+
+    cuda_bin = str(cuda_bin_dir)
+    path_entries = os.environ.get("PATH", "").split(os.pathsep)
+    if cuda_bin not in path_entries:
+        os.environ["PATH"] = cuda_bin + os.pathsep + os.environ.get("PATH", "")
+
+    if hasattr(os, "add_dll_directory"):
+        os.add_dll_directory(cuda_bin)
+
+
+def find_cuda_bin_dir() -> Optional[Path]:
+    candidates: List[Path] = []
+
+    for env_var in ("CUDA_PATH", "CUDA_HOME"):
+        value = os.getenv(env_var)
+        if value:
+            candidates.append(Path(value) / "bin")
+
+    cuda_root = Path("C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA")
+    if cuda_root.is_dir():
+        candidates.extend(
+            sorted(
+                [path / "bin" for path in cuda_root.glob("v12.*") if path.is_dir()],
+                reverse=True,
+            )
+        )
+
+    for candidate in candidates:
+        if (candidate / "cublas64_12.dll").is_file():
+            print(f"Using CUDA DLL directory: {candidate}")
+            return candidate
+
+    return None
 
 
 def translate_plain_batch_with_ct2(
@@ -412,7 +484,13 @@ def translate_plain_batch_with_ct2(
             )
             for text in batch
         ]
-        results = translator.translate_batch(source_batches, beam_size=1)
+        try:
+            results = translator.translate_batch(source_batches, beam_size=1)
+        except RuntimeError as exc:
+            if is_cuda_runtime_load_error(exc):
+                raise RuntimeError(CUDA_DLL_HELP) from exc
+            raise
+
         if len(results) != len(batch):
             raise RuntimeError(
                 f"CTranslate2 returned {len(results)} translations for "
@@ -427,6 +505,31 @@ def translate_plain_batch_with_ct2(
             )
 
     return translations
+
+
+def verify_ct2_backend_available(args: argparse.Namespace) -> Ct2TranslatorBackend:
+    print(
+        "Checking local translation backend "
+        f"({args.ct2_device}, {args.ct2_compute_type})..."
+    )
+    backend = create_ct2_backend(args)
+    translate_plain_batch_with_ct2(
+        ["Hallo Welt"],
+        backend.translator,
+        backend.tokenizer,
+        batch_size=1,
+    )
+    print("Local translation backend is ready.")
+    return backend
+
+
+def is_cuda_runtime_load_error(exc: RuntimeError) -> bool:
+    message = str(exc).lower()
+    return (
+        "cublas64_12.dll" in message
+        or "cublas" in message and "not found" in message
+        or "cuda" in message and "cannot be loaded" in message
+    )
 
 
 def split_surrounding_whitespace(text: str) -> Tuple[str, str, str]:
@@ -598,24 +701,14 @@ def get_cached_or_translate_texts(
 def translate_targets_with_ct2(
     targets: List[TranslationTarget],
     args: argparse.Namespace,
+    backend: Optional[Ct2TranslatorBackend] = None,
 ) -> Dict[Tuple[str, str, str], str]:
     """
     Returns:
       (item_id, item_type, field) -> translated_text
     """
-    translator, tokenizer = create_ct2_translator(
-        ct2_model_dir=args.ct2_model_dir,
-        tokenizer_model=args.hf_tokenizer_model,
-        device=args.ct2_device,
-        compute_type=args.ct2_compute_type,
-    )
-    backend = Ct2TranslatorBackend(
-        translator=translator,
-        tokenizer=tokenizer,
-        tokenizer_model=args.hf_tokenizer_model,
-        ct2_model_dir=args.ct2_model_dir,
-        batch_size=args.translation_batch_size,
-    )
+    if backend is None:
+        backend = create_ct2_backend(args)
 
     print(f"Loading translation cache: {TRANSLATION_CACHE_FILE}")
     cache = load_translation_cache()
@@ -984,7 +1077,10 @@ def main() -> int:
     parser.add_argument(
         "--ct2-compute-type",
         default="int8",
-        help='CTranslate2 compute type, e.g. "int8", "float32", or "float16".',
+        help=(
+            'CTranslate2 compute type, e.g. "int8", "int8_float16", '
+            '"float32", or "float16".'
+        ),
     )
     parser.add_argument(
         "--translation-batch-size",
@@ -1018,6 +1114,12 @@ def main() -> int:
     if args.translation_batch_size < 1:
         print("--translation-batch-size must be at least 1", file=sys.stderr)
         return 2
+
+    translation_backend: Optional[Ct2TranslatorBackend] = None
+    if args.translator == "ct2":
+        translation_backend = verify_ct2_backend_available(args)
+    else:
+        raise ValueError(f"Unsupported translator backend: {args.translator}")
 
     source_board_id = extract_board_id(args.source_board)
     clone_name = args.clone_name or make_default_clone_name(args.clone_prefix)
@@ -1074,10 +1176,11 @@ def main() -> int:
         board_id=clone_board_id,
     )
 
-    if args.translator == "ct2":
-        translations = translate_targets_with_ct2(targets=targets, args=args)
-    else:
-        raise ValueError(f"Unsupported translator backend: {args.translator}")
+    translations = translate_targets_with_ct2(
+        targets=targets,
+        args=args,
+        backend=translation_backend,
+    )
 
     updated = apply_translations_to_miro(
         miro_token=miro_token,
