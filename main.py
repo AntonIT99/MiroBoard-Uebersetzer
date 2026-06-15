@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import json
 import os
 import re
 import sys
@@ -8,6 +9,7 @@ import time
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import quote, unquote, urlparse
 
@@ -16,6 +18,18 @@ from dotenv import load_dotenv
 
 
 MIRO_API_BASE = "https://api.miro.com/v2"
+DEFAULT_CT2_MODEL_DIR = "models/opus-mt-de-en-ct2"
+DEFAULT_HF_TOKENIZER_MODEL = "Helsinki-NLP/opus-mt-de-en"
+TRANSLATION_CACHE_FILE = Path("translation_cache_ct2_de_en.json")
+CT2_CONVERSION_COMMAND = (
+    "ct2-transformers-converter --model Helsinki-NLP/opus-mt-de-en "
+    "--output_dir models/opus-mt-de-en-ct2 --quantization int8 --force"
+)
+PYTHON_DEPENDENCIES_COMMAND = (
+    "pip install ctranslate2 transformers sentencepiece sacremoses beautifulsoup4 "
+    "requests python-dotenv"
+)
+TRANSLATION_CACHE_SAVE_INTERVAL = 500
 
 # Item type -> endpoint segment
 MIRO_UPDATE_ENDPOINTS = {
@@ -153,13 +167,6 @@ def miro_headers(token: str) -> Dict[str, str]:
     }
 
 
-def deepl_headers(auth_key: str) -> Dict[str, str]:
-    return {
-        "Authorization": f"DeepL-Auth-Key {auth_key}",
-        "Content-Type": "application/json",
-    }
-
-
 def copy_board(
     miro_token: str,
     source_board_id: str,
@@ -246,120 +253,427 @@ def collect_translation_targets(items: List[Dict[str, Any]]) -> List[Translation
     return targets
 
 
-def chunk_targets(
-    targets: List[TranslationTarget],
-    max_payload_bytes: int = 100_000,
-) -> Iterable[List[TranslationTarget]]:
-    """
-    DeepL has a request body size limit. This keeps batches safely below it.
-    """
-    batch: List[TranslationTarget] = []
-    current_size = 0
+def chunk_list(values: List[Any], batch_size: int) -> Iterable[List[Any]]:
+    if batch_size < 1:
+        raise ValueError("--translation-batch-size must be at least 1")
 
-    for target in targets:
-        text_size = len(target.source_text.encode("utf-8")) + 200
-
-        if batch and current_size + text_size > max_payload_bytes:
-            yield batch
-            batch = []
-            current_size = 0
-
-        batch.append(target)
-        current_size += text_size
-
-    if batch:
-        yield batch
+    for index in range(0, len(values), batch_size):
+        yield values[index : index + batch_size]
 
 
-def get_deepl_url(auth_key: str) -> str:
-    explicit_url = os.getenv("DEEPL_API_URL")
-    if explicit_url:
-        return explicit_url
-
-    # DeepL Free API keys usually end with ":fx".
-    if auth_key.endswith(":fx"):
-        return "https://api-free.deepl.com/v2/translate"
-
-    return "https://api.deepl.com/v2/translate"
+@dataclass
+class Ct2TranslatorBackend:
+    translator: Any
+    tokenizer: Any
+    tokenizer_model: str
+    ct2_model_dir: str
+    batch_size: int
 
 
-def translate_batch(
-    deepl_auth_key: str,
-    targets: List[TranslationTarget],
-    *,
-    source_lang: Optional[str],
-    target_lang: str,
-    tag_handling_html: bool,
-) -> List[str]:
-    url = get_deepl_url(deepl_auth_key)
+@dataclass
+class TranslationStats:
+    cached_translations_used: int = 0
+    newly_generated_translations: int = 0
+    completed_fields: int = 0
 
-    body: Dict[str, Any] = {
-        "text": [target.source_text for target in targets],
-        "target_lang": target_lang,
-    }
 
-    if source_lang:
-        body["source_lang"] = source_lang
+@dataclass
+class HtmlTextReplacement:
+    node: Any
+    prefix: str
+    source_text: str
+    suffix: str
 
-    if tag_handling_html:
-        body["tag_handling"] = "html"
 
-    payload = request_json(
-        "POST",
-        url,
-        headers=deepl_headers(deepl_auth_key),
-        json=body,
+@dataclass
+class PreparedTranslationTarget:
+    target: TranslationTarget
+    soup: Optional[Any]
+    html_replacements: List[HtmlTextReplacement]
+    plain_source_text: Optional[str]
+
+
+def load_translation_cache() -> Dict[str, str]:
+    if not TRANSLATION_CACHE_FILE.exists():
+        return {}
+
+    try:
+        with TRANSLATION_CACHE_FILE.open("r", encoding="utf-8") as cache_file:
+            cache = json.load(cache_file)
+    except (OSError, json.JSONDecodeError) as exc:
+        print(
+            f"WARNING: Could not read {TRANSLATION_CACHE_FILE}: {exc}. "
+            "Starting with an empty translation cache.",
+            file=sys.stderr,
+        )
+        return {}
+
+    if not isinstance(cache, dict):
+        print(
+            f"WARNING: {TRANSLATION_CACHE_FILE} does not contain a JSON object. "
+            "Starting with an empty translation cache.",
+            file=sys.stderr,
+        )
+        return {}
+
+    return {str(key): str(value) for key, value in cache.items()}
+
+
+def save_translation_cache(cache: Dict[str, str]) -> None:
+    tmp_path = TRANSLATION_CACHE_FILE.with_suffix(".tmp")
+    with tmp_path.open("w", encoding="utf-8") as cache_file:
+        json.dump(cache, cache_file, ensure_ascii=False, indent=2, sort_keys=True)
+        cache_file.write("\n")
+    tmp_path.replace(TRANSLATION_CACHE_FILE)
+
+
+def make_translation_cache_key(
+    text: str,
+    tokenizer_model: str,
+    ct2_model_dir: str,
+) -> str:
+    return json.dumps(
+        {
+            "source_text": text,
+            "tokenizer_model": tokenizer_model,
+            "ct2_model_dir": str(Path(ct2_model_dir)),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
     )
 
-    translations = payload.get("translations", [])
-    if len(translations) != len(targets):
-        raise ApiError(
-            f"DeepL returned {len(translations)} translations for {len(targets)} texts"
+
+def create_ct2_translator(
+    ct2_model_dir: str,
+    tokenizer_model: str,
+    device: str,
+    compute_type: str,
+) -> Tuple[Any, Any]:
+    model_path = Path(ct2_model_dir)
+    if not model_path.is_dir():
+        raise RuntimeError(
+            f"Missing converted CTranslate2 model directory: {ct2_model_dir}\n"
+            "Create it with:\n"
+            f"  {CT2_CONVERSION_COMMAND}"
         )
 
-    return [entry["text"] for entry in translations]
+    try:
+        import ctranslate2
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "Missing Python package 'ctranslate2'. Install dependencies with:\n"
+            f"  {PYTHON_DEPENDENCIES_COMMAND}"
+        ) from exc
+
+    try:
+        from transformers import AutoTokenizer
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "Missing Python package 'transformers'. Install dependencies with:\n"
+            f"  {PYTHON_DEPENDENCIES_COMMAND}"
+        ) from exc
+
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_model)
+    except (ImportError, ValueError) as exc:
+        raise RuntimeError(
+            "Could not load the Hugging Face tokenizer. Make sure sentencepiece "
+            "and sacremoses are installed:\n"
+            f"  {PYTHON_DEPENDENCIES_COMMAND}"
+        ) from exc
+    except OSError as exc:
+        raise RuntimeError(
+            f"Could not load tokenizer '{tokenizer_model}'. If this machine is "
+            "offline, download/cache the tokenizer first or use a local tokenizer "
+            "directory."
+        ) from exc
+
+    translator = ctranslate2.Translator(
+        str(model_path),
+        device=device,
+        compute_type=compute_type,
+    )
+
+    return translator, tokenizer
 
 
-def translate_targets(
-    deepl_auth_key: str,
+def translate_plain_batch_with_ct2(
+    texts: List[str],
+    translator: Any,
+    tokenizer: Any,
+    batch_size: int,
+) -> List[str]:
+    translations: List[str] = []
+
+    for batch in chunk_list(texts, batch_size):
+        source_batches = [
+            tokenizer.convert_ids_to_tokens(
+                tokenizer.encode(text, add_special_tokens=True)
+            )
+            for text in batch
+        ]
+        results = translator.translate_batch(source_batches, beam_size=1)
+        if len(results) != len(batch):
+            raise RuntimeError(
+                f"CTranslate2 returned {len(results)} translations for "
+                f"{len(batch)} input texts"
+            )
+
+        for result in results:
+            output_tokens = result.hypotheses[0]
+            output_ids = tokenizer.convert_tokens_to_ids(output_tokens)
+            translations.append(
+                tokenizer.decode(output_ids, skip_special_tokens=True).strip()
+            )
+
+    return translations
+
+
+def split_surrounding_whitespace(text: str) -> Tuple[str, str, str]:
+    prefix_match = re.match(r"\s*", text)
+    suffix_match = re.search(r"\s*$", text)
+
+    prefix = prefix_match.group(0) if prefix_match else ""
+    suffix = suffix_match.group(0) if suffix_match else ""
+    core_start = len(prefix)
+    core_end = len(text) - len(suffix)
+
+    if core_start >= core_end:
+        return text, "", ""
+
+    return prefix, text[core_start:core_end], suffix
+
+
+def import_beautifulsoup() -> Tuple[Any, Any]:
+    try:
+        from bs4 import BeautifulSoup, NavigableString
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "Missing Python package 'beautifulsoup4'. Install dependencies with:\n"
+            f"  {PYTHON_DEPENDENCIES_COMMAND}"
+        ) from exc
+
+    return BeautifulSoup, NavigableString
+
+
+def translate_html_preserving_tags_with_ct2(
+    html: str,
+    translator: Any,
+    tokenizer: Any,
+    batch_size: int,
+) -> str:
+    BeautifulSoup, NavigableString = import_beautifulsoup()
+    soup = BeautifulSoup(html, "html.parser")
+    replacements: List[HtmlTextReplacement] = []
+
+    for node in soup.find_all(string=True):
+        if not isinstance(node, NavigableString):
+            continue
+
+        original_text = str(node)
+        prefix, core_text, suffix = split_surrounding_whitespace(original_text)
+        if not core_text:
+            continue
+
+        replacements.append(
+            HtmlTextReplacement(
+                node=node,
+                prefix=prefix,
+                source_text=core_text,
+                suffix=suffix,
+            )
+        )
+
+    translated_texts = translate_plain_batch_with_ct2(
+        [replacement.source_text for replacement in replacements],
+        translator,
+        tokenizer,
+        batch_size,
+    )
+
+    for replacement, translated_text in zip(replacements, translated_texts):
+        replacement.node.replace_with(
+            replacement.prefix + translated_text + replacement.suffix
+        )
+
+    return str(soup)
+
+
+def prepare_translation_target(target: TranslationTarget) -> PreparedTranslationTarget:
+    if not target.is_html:
+        return PreparedTranslationTarget(
+            target=target,
+            soup=None,
+            html_replacements=[],
+            plain_source_text=target.source_text,
+        )
+
+    BeautifulSoup, NavigableString = import_beautifulsoup()
+    soup = BeautifulSoup(target.source_text, "html.parser")
+    replacements: List[HtmlTextReplacement] = []
+
+    for node in soup.find_all(string=True):
+        if not isinstance(node, NavigableString):
+            continue
+
+        original_text = str(node)
+        prefix, core_text, suffix = split_surrounding_whitespace(original_text)
+        if not core_text:
+            continue
+
+        replacements.append(
+            HtmlTextReplacement(
+                node=node,
+                prefix=prefix,
+                source_text=core_text,
+                suffix=suffix,
+            )
+        )
+
+    return PreparedTranslationTarget(
+        target=target,
+        soup=soup,
+        html_replacements=replacements,
+        plain_source_text=None,
+    )
+
+
+def get_cached_or_translate_texts(
+    texts: List[str],
+    backend: Ct2TranslatorBackend,
+    cache: Dict[str, str],
+    stats: TranslationStats,
+) -> Dict[str, str]:
+    translated_by_text: Dict[str, str] = {}
+    texts_to_translate: List[str] = []
+    seen_missing: set[str] = set()
+
+    for text in texts:
+        cache_key = make_translation_cache_key(
+            text,
+            backend.tokenizer_model,
+            backend.ct2_model_dir,
+        )
+
+        if cache_key in cache:
+            translated_by_text[text] = cache[cache_key]
+            stats.cached_translations_used += 1
+            continue
+
+        if text not in seen_missing:
+            texts_to_translate.append(text)
+            seen_missing.add(text)
+
+    if not texts_to_translate:
+        return translated_by_text
+
+    generated_since_save = 0
+    for batch in chunk_list(texts_to_translate, backend.batch_size):
+        translated_batch = translate_plain_batch_with_ct2(
+            batch,
+            backend.translator,
+            backend.tokenizer,
+            backend.batch_size,
+        )
+
+        for source_text, translated_text in zip(batch, translated_batch):
+            translated_by_text[source_text] = translated_text
+            cache_key = make_translation_cache_key(
+                source_text,
+                backend.tokenizer_model,
+                backend.ct2_model_dir,
+            )
+            cache[cache_key] = translated_text
+
+        stats.newly_generated_translations += len(batch)
+        generated_since_save += len(batch)
+
+        if generated_since_save >= TRANSLATION_CACHE_SAVE_INTERVAL:
+            save_translation_cache(cache)
+            generated_since_save = 0
+
+    return translated_by_text
+
+
+def translate_targets_with_ct2(
     targets: List[TranslationTarget],
-    *,
-    source_lang: Optional[str],
-    target_lang: str,
+    args: argparse.Namespace,
 ) -> Dict[Tuple[str, str, str], str]:
     """
     Returns:
       (item_id, item_type, field) -> translated_text
     """
-    result: Dict[Tuple[str, str, str], str] = {}
+    translator, tokenizer = create_ct2_translator(
+        ct2_model_dir=args.ct2_model_dir,
+        tokenizer_model=args.hf_tokenizer_model,
+        device=args.ct2_device,
+        compute_type=args.ct2_compute_type,
+    )
+    backend = Ct2TranslatorBackend(
+        translator=translator,
+        tokenizer=tokenizer,
+        tokenizer_model=args.hf_tokenizer_model,
+        ct2_model_dir=args.ct2_model_dir,
+        batch_size=args.translation_batch_size,
+    )
 
-    html_targets = [t for t in targets if t.is_html]
-    plain_targets = [t for t in targets if not t.is_html]
+    print(f"Loading translation cache: {TRANSLATION_CACHE_FILE}")
+    cache = load_translation_cache()
+    stats = TranslationStats()
+    prepared_targets = [prepare_translation_target(target) for target in targets]
 
-    for label, group, tag_handling_html in [
-        ("HTML/Rich Text", html_targets, True),
-        ("Plain Text", plain_targets, False),
-    ]:
-        if not group:
+    texts_to_translate: List[str] = []
+    for prepared in prepared_targets:
+        if prepared.plain_source_text is not None:
+            texts_to_translate.append(prepared.plain_source_text)
             continue
 
-        print(f"Translating {len(group)} {label} fields...")
+        texts_to_translate.extend(
+            replacement.source_text for replacement in prepared.html_replacements
+        )
 
-        done = 0
-        for batch in chunk_targets(group):
-            translations = translate_batch(
-                deepl_auth_key,
-                batch,
-                source_lang=source_lang,
-                target_lang=target_lang,
-                tag_handling_html=tag_handling_html,
+    print(
+        f"Translating {len(targets)} fields locally with CTranslate2 "
+        f"({len(set(texts_to_translate))} unique text units)..."
+    )
+
+    translated_by_text = get_cached_or_translate_texts(
+        texts=texts_to_translate,
+        backend=backend,
+        cache=cache,
+        stats=stats,
+    )
+
+    result: Dict[Tuple[str, str, str], str] = {}
+
+    for prepared in prepared_targets:
+        target = prepared.target
+
+        if prepared.plain_source_text is not None:
+            translated_text = translated_by_text.get(
+                prepared.plain_source_text,
+                prepared.plain_source_text,
             )
+        else:
+            for replacement in prepared.html_replacements:
+                translated_text_node = translated_by_text.get(
+                    replacement.source_text,
+                    replacement.source_text,
+                )
+                replacement.node.replace_with(
+                    replacement.prefix + translated_text_node + replacement.suffix
+                )
+            translated_text = str(prepared.soup)
 
-            for target, translated in zip(batch, translations):
-                result[(target.item_id, target.item_type, target.field)] = translated
+        result[(target.item_id, target.item_type, target.field)] = translated_text
+        stats.completed_fields += 1
 
-            done += len(batch)
-            print(f"  {done}/{len(group)} translated")
+        if stats.completed_fields % 100 == 0 or stats.completed_fields == len(targets):
+            print(f"  {stats.completed_fields}/{len(targets)} fields translated")
+
+    save_translation_cache(cache)
+    print(f"Cached translations used: {stats.cached_translations_used}")
+    print(f"Newly generated translations: {stats.newly_generated_translations}")
 
     return result
 
@@ -521,8 +835,8 @@ def verify_miro_write_access(
 ) -> None:
     """
     Performs a cheap create/update/delete cycle before reading all board items or
-    calling DeepL. This catches widget write permission problems as early as the
-    Miro API allows.
+    translating locally. This catches widget write permission problems before
+    local translation starts.
     """
     print("Checking Miro write access on cloned board...")
     preflight_item_id: Optional[str] = None
@@ -630,12 +944,53 @@ def main() -> int:
     parser.add_argument(
         "--source-lang",
         default="DE",
-        help='DeepL source language, e.g. "DE". Use empty string for auto-detect.',
+        help=(
+            'Source language label kept for CLI compatibility. The default CT2 '
+            'model translates German to English.'
+        ),
     )
     parser.add_argument(
         "--target-lang",
         default="EN-US",
-        help='DeepL target language, e.g. "EN-US" or "EN-GB".',
+        help=(
+            'Target language label kept for CLI compatibility. The default CT2 '
+            'model translates German to English.'
+        ),
+    )
+    parser.add_argument(
+        "--translator",
+        default="ct2",
+        choices=["ct2"],
+        help='Translation backend. Default: "ct2".',
+    )
+    parser.add_argument(
+        "--ct2-model-dir",
+        default=DEFAULT_CT2_MODEL_DIR,
+        help=f"Converted CTranslate2 model directory. Default: {DEFAULT_CT2_MODEL_DIR}",
+    )
+    parser.add_argument(
+        "--hf-tokenizer-model",
+        default=DEFAULT_HF_TOKENIZER_MODEL,
+        help=(
+            "Hugging Face tokenizer model name or local tokenizer directory. "
+            f"Default: {DEFAULT_HF_TOKENIZER_MODEL}"
+        ),
+    )
+    parser.add_argument(
+        "--ct2-device",
+        default="cpu",
+        help='CTranslate2 device, e.g. "cpu" or "cuda". Default: "cpu".',
+    )
+    parser.add_argument(
+        "--ct2-compute-type",
+        default="int8",
+        help='CTranslate2 compute type, e.g. "int8", "float32", or "float16".',
+    )
+    parser.add_argument(
+        "--translation-batch-size",
+        type=int,
+        default=32,
+        help="Number of plain text units translated per CTranslate2 batch.",
     )
     parser.add_argument(
         "--sleep-after-copy",
@@ -646,25 +1001,26 @@ def main() -> int:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Create the clone and translate, but do not write translations back.",
+        help=(
+            "Create the clone, run the write preflight, and translate locally, "
+            "but do not write translated fields back."
+        ),
     )
 
     args = parser.parse_args()
 
     miro_token = os.getenv("MIRO_ACCESS_TOKEN")
-    deepl_auth_key = os.getenv("DEEPL_AUTH_KEY")
 
     if not miro_token:
         print("Missing MIRO_ACCESS_TOKEN in environment or .env", file=sys.stderr)
         return 2
 
-    if not deepl_auth_key:
-        print("Missing DEEPL_AUTH_KEY in environment or .env", file=sys.stderr)
+    if args.translation_batch_size < 1:
+        print("--translation-batch-size must be at least 1", file=sys.stderr)
         return 2
 
     source_board_id = extract_board_id(args.source_board)
     clone_name = args.clone_name or make_default_clone_name(args.clone_prefix)
-    source_lang = args.source_lang.strip() or None
 
     print(f"Source board: {source_board_id}")
     print(f"Creating clone: {clone_name}")
@@ -690,12 +1046,6 @@ def main() -> int:
     if view_link:
         print(f"Clone link: {view_link}")
 
-    if not args.dry_run:
-        verify_miro_write_access(
-            miro_token=miro_token,
-            board_id=clone_board_id,
-        )
-
     if args.sleep_after_copy > 0:
         print(f"Waiting {args.sleep_after_copy}s for board copy to settle...")
         time.sleep(args.sleep_after_copy)
@@ -719,12 +1069,15 @@ def main() -> int:
         print("No translatable fields found.")
         return 0
 
-    translations = translate_targets(
-        deepl_auth_key=deepl_auth_key,
-        targets=targets,
-        source_lang=source_lang,
-        target_lang=args.target_lang,
+    verify_miro_write_access(
+        miro_token=miro_token,
+        board_id=clone_board_id,
     )
+
+    if args.translator == "ct2":
+        translations = translate_targets_with_ct2(targets=targets, args=args)
+    else:
+        raise ValueError(f"Unsupported translator backend: {args.translator}")
 
     updated = apply_translations_to_miro(
         miro_token=miro_token,

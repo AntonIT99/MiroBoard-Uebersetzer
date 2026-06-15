@@ -45,6 +45,8 @@ Thumbs.db
 translated_report.json
 reports/
 
-# Miro/DeepL local output
+# Miro/local translation output
+models/
+translation_cache_ct2_de_en.json
 *.tmp
 *.bak

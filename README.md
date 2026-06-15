@@ -1,6 +1,6 @@
 # Miro Board Übersetzer
 
-Dieses Tool erstellt einen englischen Klon eines bestehenden Miro-Boards und übersetzt unterstützte Textelemente automatisch mit DeepL.
+Dieses Tool erstellt einen englischen Klon eines bestehenden Miro-Boards und übersetzt unterstützte Textelemente lokal mit CTranslate2 und dem Hugging-Face-Modell `Helsinki-NLP/opus-mt-de-en`.
 
 ## Funktionsweise
 
@@ -8,8 +8,9 @@ Das Script:
 
 1. kopiert ein bestehendes Miro-Board,
 2. liest alle unterstützten Board-Items aus der Kopie,
-3. übersetzt gefundene Texte nach Englisch,
-4. schreibt die übersetzten Texte zurück in den geklonten Board.
+3. prüft Schreibrechte auf der Kopie,
+4. übersetzt gefundene Texte lokal nach Englisch,
+5. schreibt die übersetzten Texte zurück in den geklonten Board.
 
 Das Original-Board bleibt unverändert.
 
@@ -53,8 +54,24 @@ Abhängigkeiten installieren:
 
 ```powershell
 python -m pip install --upgrade pip
-pip install requests python-dotenv
+pip install ctranslate2 transformers sentencepiece sacremoses beautifulsoup4 requests python-dotenv
 ```
+
+## Lokales Übersetzungsmodell vorbereiten
+
+Das Script verwendet standardmäßig das Modell `Helsinki-NLP/opus-mt-de-en`, das einmalig heruntergeladen und nach CTranslate2 konvertiert werden muss:
+
+```powershell
+ct2-transformers-converter --model Helsinki-NLP/opus-mt-de-en --output_dir models/opus-mt-de-en-ct2 --quantization int8 --force
+```
+
+Danach liegt das lokale CTranslate2-Modell in:
+
+```text
+models/opus-mt-de-en-ct2
+```
+
+Nach dem Download und der Konvertierung läuft die Übersetzung lokal/offline und verursacht keine DeepL- oder Cloud-Übersetzungskosten.
 
 ## Konfiguration
 
@@ -62,7 +79,6 @@ Im Projektordner eine `.env` Datei anlegen:
 
 ```env
 MIRO_ACCESS_TOKEN=dein_miro_oauth_access_token
-DEEPL_AUTH_KEY=dein_deepl_api_key
 ```
 
 Der Miro-Token muss zu einem Miro-Nutzer gehören, der den geklonten Board bearbeiten
@@ -72,35 +88,26 @@ diesem Miro-Nutzer öffnen und prüfen, ob Elemente manuell bearbeitet werden k�
 Falls nicht, App neu autorisieren bzw. den Board in einem Team klonen, in dem die App
 installiert ist und der Nutzer Bearbeitungsrechte hat.
 
-Das Script prüft diese Schreibrechte direkt nach dem Klonen mit einem temporären
-Test-Shape. Erst wenn Erstellen, Aktualisieren und Löschen dieses Test-Elements
-funktionieren, werden Board-Items gelesen und DeepL-Übersetzungen gestartet.
+Das Script prüft diese Schreibrechte nach dem Lesen der Board-Items und vor der
+lokalen Übersetzung mit einem temporären Test-Shape. Erst wenn Erstellen,
+Aktualisieren und Löschen dieses Test-Elements funktionieren, startet die
+Übersetzung.
 
 Optional kann mit `--target-team-id` gesteuert werden, in welchem Miro-Team der
 geklonte Board erstellt wird. Der Token-Nutzer und die Miro-App müssen auch in
 diesem Ziel-Team die nötigen Rechte haben. Ohne `--target-team-id` entscheidet
 Miro anhand des Token-/Account-Kontexts, in welchem Team der Klon landet.
 
-Für DeepL Free wird normalerweise automatisch die Free-API-URL verwendet, wenn der API-Key auf `:fx` endet.
-
-Optional kann die DeepL-API-URL manuell gesetzt werden:
-
-```env
-DEEPL_API_URL=https://api-free.deepl.com/v2/translate
-```
-
-oder für DeepL Pro:
-
-```env
-DEEPL_API_URL=https://api.deepl.com/v2/translate
-```
+Übersetzungen werden in `translation_cache_ct2_de_en.json` zwischengespeichert.
+Der Cache-Key enthält den Ausgangstext, das Tokenizer-Modell und den lokalen
+CTranslate2-Modellpfad. Identische Texte werden dadurch nicht erneut übersetzt.
 
 ## Verwendung
 
 ### Board mit Board-ID übersetzen
 
 ```powershell
-python translate_miro_board.py `
+python main.py `
   --source-board "uXjVDEINBOARDID=" `
   --clone-name "[EN] Mein Workshop"
 ```
@@ -108,59 +115,93 @@ python translate_miro_board.py `
 ### Board mit vollständiger Miro-URL übersetzen
 
 ```powershell
-python translate_miro_board.py `
+python main.py `
   --source-board "https://miro.com/app/board/uXjVDEINBOARDID=/" `
   --clone-name "[EN] Mein Workshop"
-```
-
-### Britisches Englisch verwenden
-
-```powershell
-python translate_miro_board.py `
-  --source-board "uXjVDEINBOARDID=" `
-  --clone-name "[EN] Mein Workshop" `
-  --target-lang "EN-GB"
-```
-
-### US-Englisch verwenden
-
-```powershell
-python translate_miro_board.py `
-  --source-board "uXjVDEINBOARDID=" `
-  --clone-name "[EN] Mein Workshop" `
-  --target-lang "EN-US"
 ```
 
 ### Klon in einem bestimmten Miro-Team erstellen
 
 ```powershell
-python translate_miro_board.py `
+python main.py `
   --source-board "uXjVDEINBOARDID=" `
   --clone-name "[EN] Mein Workshop" `
   --target-team-id "DEIN_MIRO_TEAM_ID"
 ```
 
-### Sprache automatisch erkennen lassen
-
-Standardmäßig ist Deutsch als Ausgangssprache gesetzt.
+### Lokales Modell explizit angeben
 
 ```powershell
-python translate_miro_board.py `
+python main.py `
   --source-board "uXjVDEINBOARDID=" `
   --clone-name "[EN] Mein Workshop" `
-  --source-lang ""
+  --translator "ct2" `
+  --ct2-model-dir "models/opus-mt-de-en-ct2" `
+  --hf-tokenizer-model "Helsinki-NLP/opus-mt-de-en" `
+  --ct2-device "cpu" `
+  --ct2-compute-type "int8" `
+  --translation-batch-size 32
 ```
 
-### Testlauf ohne Miro-Updates
+### NVIDIA-GPU verwenden
 
-Der Klon wird erstellt und die Übersetzung wird vorbereitet, aber die übersetzten Texte werden nicht in Miro zurückgeschrieben.
+Für schnelle Übersetzung auf einer NVIDIA-GPU wie RTX 4080 Super oder RTX 5070 Ti
+empfiehlt sich:
 
 ```powershell
-python translate_miro_board.py `
+python main.py `
+  --source-board "uXjVDEINBOARDID=" `
+  --clone-name "[EN] Mein Workshop" `
+  --target-team-id "DEIN_MIRO_TEAM_ID" `
+  --ct2-device "cuda" `
+  --ct2-compute-type "int8_float16" `
+  --translation-batch-size 64
+```
+
+Wenn CUDA/CTranslate2 auf dem System noch nicht korrekt eingerichtet ist oder
+Speicherfehler auftreten, zuerst auf die CPU-Variante zurückgehen:
+
+```powershell
+python main.py `
+  --source-board "uXjVDEINBOARDID=" `
+  --clone-name "[EN] Mein Workshop" `
+  --target-team-id "DEIN_MIRO_TEAM_ID" `
+  --ct2-device "cpu" `
+  --ct2-compute-type "int8" `
+  --translation-batch-size 32
+```
+
+### Testlauf ohne finale Miro-Updates
+
+Der Klon wird erstellt, der Schreibrechte-Preflight läuft, und die Übersetzung
+wird vorbereitet. Die übersetzten Texte werden aber nicht in Miro
+zurückgeschrieben.
+
+```powershell
+python main.py `
   --source-board "uXjVDEINBOARDID=" `
   --clone-name "[EN TEST] Mein Workshop" `
   --dry-run
 ```
+
+## CLI-Argumente
+
+| Argument | Default | Beschreibung |
+| --- | --- | --- |
+| `--source-board` | erforderlich | Miro-Board-ID oder vollständige Miro-Board-URL. |
+| `--clone-name` | automatisch aus `--clone-prefix` | Name des geklonten Boards. |
+| `--clone-prefix` | `[EN]` | Prefix für automatisch erzeugte Clone-Namen. |
+| `--target-team-id` | leer | Optionales Miro-Ziel-Team für den geklonten Board. |
+| `--translator` | `ct2` | Übersetzungsbackend. Aktuell ist nur `ct2` unterstützt. |
+| `--ct2-model-dir` | `models/opus-mt-de-en-ct2` | Lokales konvertiertes CTranslate2-Modell. |
+| `--hf-tokenizer-model` | `Helsinki-NLP/opus-mt-de-en` | Hugging-Face-Tokenizer-Modell oder lokaler Tokenizer-Pfad. |
+| `--ct2-device` | `cpu` | CTranslate2-Gerät, z. B. `cpu` oder `cuda`. |
+| `--ct2-compute-type` | `int8` | CTranslate2-Compute-Type, z. B. `int8`, `int8_float16`, `float32` oder `float16`. |
+| `--translation-batch-size` | `32` | Anzahl Plain-Text-Einheiten pro lokaler Übersetzungsbatch. |
+| `--sleep-after-copy` | `3.0` | Wartezeit nach dem Kopieren, bevor Items gelesen werden. |
+| `--dry-run` | aus | Erstellt den Klon, führt den Schreibrechte-Preflight aus und übersetzt lokal, schreibt aber keine Texte zurück. |
+| `--source-lang` | `DE` | Kompatibilitätsargument; das Standardmodell ist fest Deutsch nach Englisch. |
+| `--target-lang` | `EN-US` | Kompatibilitätsargument; das Standardmodell ist fest Deutsch nach Englisch. |
 
 ## Typischer Ablauf
 
@@ -169,7 +210,7 @@ cd C:\Pfad\zum\Projekt
 
 .\.venv\Scripts\activate
 
-python translate_miro_board.py `
+python main.py `
   --source-board "https://miro.com/app/board/uXjVDEINBOARDID=/" `
   --clone-name "[EN] Mein Workshop"
 ```
