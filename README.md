@@ -57,12 +57,25 @@ python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
+`torch` wird für die einmalige Hugging-Face-nach-CTranslate2-Konvertierung
+benötigt. Die spätere Übersetzung läuft über CTranslate2.
+
 ## Lokales Übersetzungsmodell vorbereiten
 
 Das Script verwendet standardmäßig das Modell `Helsinki-NLP/opus-mt-de-en`, das einmalig heruntergeladen und nach CTranslate2 konvertiert werden muss:
 
 ```powershell
 ct2-transformers-converter --model Helsinki-NLP/opus-mt-de-en --output_dir models/opus-mt-de-en-ct2 --quantization int8 --force
+```
+
+Unter Windows kann der explizite Aufruf aus der virtuellen Umgebung robuster sein:
+
+```powershell
+.\.venv\Scripts\ct2-transformers-converter.exe `
+  --model Helsinki-NLP/opus-mt-de-en `
+  --output_dir models/opus-mt-de-en-ct2 `
+  --quantization int8 `
+  --force
 ```
 
 Danach liegt das lokale CTranslate2-Modell in:
