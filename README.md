@@ -54,7 +54,7 @@ Abhängigkeiten installieren:
 
 ```powershell
 python -m pip install --upgrade pip
-pip install ctranslate2 transformers sentencepiece sacremoses beautifulsoup4 requests python-dotenv
+pip install -r requirements.txt
 ```
 
 ## Lokales Übersetzungsmodell vorbereiten

@@ -1,0 +1,7 @@
+ctranslate2
+transformers
+sentencepiece
+sacremoses
+beautifulsoup4
+requests
+python-dotenv
