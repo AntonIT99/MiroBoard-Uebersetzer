@@ -1,6 +1,6 @@
 # Miro Board Übersetzer
 
-Dieses Tool erstellt einen englischen Klon eines bestehenden Miro-Boards und übersetzt unterstützte Textelemente lokal mit CTranslate2 und dem Hugging-Face-Modell `Helsinki-NLP/opus-mt-de-en`.
+Dieses Tool erstellt einen englischen Klon eines bestehenden Miro-Boards oder aktualisiert einen bestehenden englischen Klon. Unterstützte Textelemente werden lokal mit CTranslate2 und dem Hugging-Face-Modell `Helsinki-NLP/opus-mt-de-en` übersetzt.
 
 ## Funktionsweise
 
@@ -14,6 +14,10 @@ Das Script:
 6. schreibt die übersetzten Texte zurück in den geklonten Board.
 
 Das Original-Board bleibt unverändert.
+
+Im Standardmodus wird ein neuer Klon erstellt. Mit `--update-existing-clone`
+kann ein bestehender englischer Klon anhand einer Sync-State-Datei aktualisiert
+werden.
 
 ## Unterstützte Elemente
 
@@ -121,14 +125,60 @@ Miro anhand des Token-/Account-Kontexts, in welchem Team der Klon landet.
 Der Cache-Key enthält den Ausgangstext, das Tokenizer-Modell und den lokalen
 CTranslate2-Modellpfad. Identische Texte werden dadurch nicht erneut übersetzt.
 
+## Glossar
+
+Domain-spezifische Begriffe können in `translation_glossary_de_en.json`
+festgelegt werden. Das Glossar wird standardmäßig verwendet und kann mit
+`--disable-glossary` deaktiviert oder mit `--glossary-file` auf eine andere Datei
+umgestellt werden.
+
+Listenformat:
+
+```json
+[
+  {
+    "source": "Nahkampf",
+    "target": "Melee",
+    "case_sensitive": false,
+    "whole_word": true
+  },
+  {
+    "source": "Fernkampf",
+    "target": "Ranged",
+    "case_sensitive": false,
+    "whole_word": true
+  }
+]
+```
+
+Einfaches Map-Format:
+
+```json
+{
+  "Nahkampf": "Melee",
+  "Fernkampf": "Ranged",
+  "Rüstung": "Armor"
+}
+```
+
+Das Glossar wirkt in zwei Schritten:
+
+* Exakter Override: Wenn eine komplette Plain-Text-Einheit nach dem Trimmen exakt
+  einem Glossar-Quellbegriff entspricht, wird direkt der Glossar-Zielbegriff
+  verwendet und CTranslate2 nicht aufgerufen.
+* Post-Processing: Nach Cache-Hit oder CTranslate2-Übersetzung werden verbliebene
+  Glossar-Quellbegriffe im übersetzten Text ersetzt. Bei HTML/Rich-Text passiert
+  das nur in Textknoten, nie in HTML-Tags.
+
 ## Verwendung
 
-### Board mit Board-ID übersetzen
+### Rebuild-Modus: neuen englischen Klon erstellen
 
 ```powershell
 python main.py `
   --source-board "uXjVDEINBOARDID=" `
-  --clone-name "[EN] Mein Workshop"
+  --clone-name "[EN] Strategy Game" `
+  --target-lang EN-US
 ```
 
 ### Board mit vollständiger Miro-URL übersetzen
@@ -138,6 +188,57 @@ python main.py `
   --source-board "https://miro.com/app/board/uXjVDEINBOARDID=/" `
   --clone-name "[EN] Mein Workshop"
 ```
+
+### Update-Modus: bestehenden englischen Klon aktualisieren
+
+```powershell
+python main.py `
+  --update-existing-clone `
+  --source-board "uXjVDEINBOARDID=" `
+  --clone-board "uXjVEXISTINGCLONEID=" `
+  --target-lang EN-US
+```
+
+Der Update-Modus benötigt eine Sync-State-Datei. Diese wird im Rebuild-Modus
+automatisch erzeugt. Wenn `--sync-state-file` nicht gesetzt ist, verwendet das
+Script einen deterministischen Dateinamen wie:
+
+```text
+miro_sync_state_uXjVDEINBOARDID__uXjVEXISTINGCLONEID.json
+```
+
+### Sync-State für vorhandenen übersetzten Klon initialisieren
+
+Wenn der englische Klon schon existiert, aber noch keine Sync-State-Datei
+vorliegt:
+
+```powershell
+python main.py `
+  --update-existing-clone `
+  --initialize-sync-state `
+  --source-board "uXjVDEINBOARDID=" `
+  --clone-board "uXjVEXISTINGCLONEID=" `
+  --target-lang EN-US
+```
+
+Die Initialisierung nutzt Positions-/Geometrie-Heuristiken, speichert die
+Sync-State-Datei und beendet den Lauf. Danach den Update-Modus erneut ausführen.
+Bei niedriger Mapping-Qualität bricht das Script ab, außer
+`--force-initialize-sync-state` wird gesetzt.
+
+### Update-Modus mit Löschen entfernter Quell-Items
+
+```powershell
+python main.py `
+  --update-existing-clone `
+  --source-board "uXjVDEINBOARDID=" `
+  --clone-board "uXjVEXISTINGCLONEID=" `
+  --delete-missing-items `
+  --target-lang EN-US
+```
+
+Ohne `--delete-missing-items` werden fehlende Quell-Items nur gemeldet, aber
+nicht aus dem englischen Klon gelöscht.
 
 ### Klon in einem bestimmten Miro-Team erstellen
 
@@ -212,9 +313,9 @@ die DLL-Suche zu registrieren.
 
 ### Testlauf ohne finale Miro-Updates
 
-Der Klon wird erstellt, der Schreibrechte-Preflight läuft, und die Übersetzung
-wird vorbereitet. Die übersetzten Texte werden aber nicht in Miro
-zurückgeschrieben.
+Der Klon wird im Rebuild-Modus erstellt und die Übersetzung wird vorbereitet.
+Item-Patches, Item-Erstellung, Item-Löschung und der temporäre
+Schreibrechte-Preflight werden übersprungen.
 
 ```powershell
 python main.py `
@@ -231,14 +332,24 @@ python main.py `
 | `--clone-name` | automatisch aus `--clone-prefix` | Name des geklonten Boards. |
 | `--clone-prefix` | `[EN]` | Prefix für automatisch erzeugte Clone-Namen. |
 | `--target-team-id` | leer | Optionales Miro-Ziel-Team für den geklonten Board. |
+| `--update-existing-clone` | aus | Aktualisiert einen bestehenden übersetzten Klon statt einen neuen Klon zu erstellen. |
+| `--clone-board` | leer | Bestehender übersetzter Klon als Board-ID oder URL; erforderlich mit `--update-existing-clone`. |
+| `--sync-state-file` | automatisch | Pfad zur Sync-State-Datei. |
+| `--initialize-sync-state` | aus | Erstellt eine Sync-State-Datei für einen bereits bestehenden übersetzten Klon und beendet den Lauf. |
+| `--force-initialize-sync-state` | aus | Erlaubt Initialisierung auch bei niedriger Mapping-Qualität. |
+| `--delete-missing-items` | aus | Löscht im Update-Modus Clone-Items, deren Source-Items nicht mehr existieren. |
+| `--update-layout` / `--no-update-layout` | an | Aktualisiert Position, Geometrie und Style im Update-Modus, soweit die Miro API es akzeptiert. |
+| `--sync-supported-items-only` / `--no-sync-supported-items-only` | an | Synchronisiert nur unterstützte translatable Item-Typen. |
 | `--translator` | `ct2` | Übersetzungsbackend. Aktuell ist nur `ct2` unterstützt. |
 | `--ct2-model-dir` | `models/opus-mt-de-en-ct2` | Lokales konvertiertes CTranslate2-Modell. |
 | `--hf-tokenizer-model` | `Helsinki-NLP/opus-mt-de-en` | Hugging-Face-Tokenizer-Modell oder lokaler Tokenizer-Pfad. |
 | `--ct2-device` | `cpu` | CTranslate2-Gerät, z. B. `cpu` oder `cuda`. |
 | `--ct2-compute-type` | `int8` | CTranslate2-Compute-Type, z. B. `int8`, `int8_float16`, `float32` oder `float16`. |
 | `--translation-batch-size` | `32` | Anzahl Plain-Text-Einheiten pro lokaler Übersetzungsbatch. |
+| `--glossary-file` | `translation_glossary_de_en.json` | JSON-Glossar für exakte Overrides und Post-Processing. |
+| `--disable-glossary` | aus | Deaktiviert das Glossar. |
 | `--sleep-after-copy` | `3.0` | Wartezeit nach dem Kopieren, bevor Items gelesen werden. |
-| `--dry-run` | aus | Erstellt den Klon, führt den Schreibrechte-Preflight aus und übersetzt lokal, schreibt aber keine Texte zurück. |
+| `--dry-run` | aus | Plant Updates und übersetzt lokal, schreibt aber keine Miro-Items. Im Rebuild-Modus wird weiterhin ein Klon erstellt. |
 | `--source-lang` | `DE` | Kompatibilitätsargument; das Standardmodell ist fest Deutsch nach Englisch. |
 | `--target-lang` | `EN-US` | Kompatibilitätsargument; das Standardmodell ist fest Deutsch nach Englisch. |
 
@@ -256,18 +367,29 @@ python main.py `
 
 Nach erfolgreichem Lauf gibt das Script die ID und, falls von Miro geliefert, den Link zum englischen Klon aus.
 
-## Hinweise
+## Sicherheit und Hinweise
 
-Dieses Tool erstellt bei jedem Lauf einen neuen englischen Klon. Es synchronisiert nicht inkrementell mit einem bereits bestehenden englischen Board.
+Der Rebuild-Modus erstellt bei jedem Lauf einen neuen englischen Klon. Der
+Update-Modus aktualisiert einen bestehenden Klon anhand der Sync-State-Datei.
+
+Für zuverlässige Updates sollte die Sync-State-Datei aus einem Rebuild-Lauf
+stammen. Bei bereits übersetzten Klonen kann `--initialize-sync-state` eine
+Best-Effort-Zuordnung über Position und Geometrie erstellen; diese Heuristik ist
+nicht perfekt.
+
+Vor destruktiven Änderungen empfiehlt sich ein Testlauf mit `--dry-run`.
+Gelöscht wird nur, wenn `--delete-missing-items` explizit gesetzt ist.
+
+Unsupported Miro-Item-Typen werden nicht destruktiv synchronisiert.
 
 Vorteile:
 
-* kein kompliziertes Mapping zwischen Original- und Klon-Items nötig
 * Original bleibt unverändert
-* einfacher manueller Workflow
-* weniger fehleranfällig
+* Rebuild-Modus bleibt einfach und robust
+* Update-Modus kann bestehende englische Boards wiederverwenden
 
 Nachteile:
 
 * der Link zum englischen Board kann sich bei jedem Lauf ändern
 * nicht alle Miro-Komponenten sind per API vollständig übersetzbar
+* Update-Modus hängt von der Qualität der Sync-State-Zuordnung ab

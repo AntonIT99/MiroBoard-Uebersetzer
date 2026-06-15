@@ -47,6 +47,6 @@ reports/
 
 # Miro/local translation output
 models/
-translation_cache_ct2_de_en.json
+miro_sync_state_*.json
 *.tmp
 *.bak

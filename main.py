@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 
 import argparse
+import hashlib
 import json
 import os
 import re
 import sys
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -21,12 +22,13 @@ MIRO_API_BASE = "https://api.miro.com/v2"
 DEFAULT_CT2_MODEL_DIR = "models/opus-mt-de-en-ct2"
 DEFAULT_HF_TOKENIZER_MODEL = "Helsinki-NLP/opus-mt-de-en"
 TRANSLATION_CACHE_FILE = Path("translation_cache_ct2_de_en.json")
+DEFAULT_GLOSSARY_FILE = "translation_glossary_de_en.json"
 CT2_CONVERSION_COMMAND = (
     "ct2-transformers-converter --model Helsinki-NLP/opus-mt-de-en "
     "--output_dir models/opus-mt-de-en-ct2 --quantization int8 --force"
 )
 PYTHON_DEPENDENCIES_COMMAND = (
-    "pip install ctranslate2 transformers sentencepiece sacremoses beautifulsoup4 "
+    "pip install ctranslate2 torch transformers sentencepiece sacremoses beautifulsoup4 "
     "requests python-dotenv"
 )
 CUDA_DLL_HELP = (
@@ -39,6 +41,10 @@ CUDA_DLL_HELP = (
     "As a fallback, run with --ct2-device cpu --ct2-compute-type int8."
 )
 TRANSLATION_CACHE_SAVE_INTERVAL = 500
+SYNC_STATE_VERSION = 1
+POSITION_PRECISION = 1
+GEOMETRY_PRECISION = 1
+LOW_MAPPING_QUALITY_THRESHOLD = 0.5
 
 # Item type -> endpoint segment
 MIRO_UPDATE_ENDPOINTS = {
@@ -66,6 +72,42 @@ class TranslationTarget:
     field: str
     source_text: str
     is_html: bool
+
+
+@dataclass
+class GlossaryEntry:
+    source: str
+    target: str
+    case_sensitive: bool = False
+    whole_word: bool = True
+
+
+@dataclass
+class Glossary:
+    path: Path
+    entries: List[GlossaryEntry]
+    enabled: bool
+
+
+@dataclass
+class SyncReport:
+    mode: str
+    source_board_id: str
+    clone_board_id: str
+    sync_state_file: Optional[Path] = None
+    translatable_source_fields: int = 0
+    mapped_items_updated: int = 0
+    new_clone_items_created: int = 0
+    stale_clone_items_detected: int = 0
+    stale_clone_items_deleted: int = 0
+    unsupported_items_skipped: int = 0
+    unmapped_source_items: int = 0
+    ambiguous_items: int = 0
+    updated_miro_items: int = 0
+    cached_translations_used: int = 0
+    newly_generated_translations: int = 0
+    glossary_exact_overrides: int = 0
+    glossary_post_replacements: int = 0
 
 
 class ApiError(RuntimeError):
@@ -270,6 +312,110 @@ def chunk_list(values: List[Any], batch_size: int) -> Iterable[List[Any]]:
         yield values[index : index + batch_size]
 
 
+def load_glossary(path: Path, disabled: bool) -> Glossary:
+    if disabled:
+        print("Glossary disabled.")
+        return Glossary(path=path, entries=[], enabled=False)
+
+    print(f"Glossary file: {path}")
+    if not path.exists():
+        print(f"Glossary file not found. Continuing without glossary: {path}")
+        return Glossary(path=path, entries=[], enabled=False)
+
+    try:
+        with path.open("r", encoding="utf-8") as glossary_file:
+            payload = json.load(glossary_file)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid glossary JSON in {path}: {exc}") from exc
+    except OSError as exc:
+        raise ValueError(f"Could not read glossary file {path}: {exc}") from exc
+
+    entries = normalize_glossary_payload(payload, path)
+    entries.sort(key=lambda entry: len(entry.source), reverse=True)
+    print(f"Loaded glossary entries: {len(entries)}")
+    return Glossary(path=path, entries=entries, enabled=bool(entries))
+
+
+def normalize_glossary_payload(payload: Any, path: Path) -> List[GlossaryEntry]:
+    entries: List[GlossaryEntry] = []
+
+    if isinstance(payload, dict):
+        for source, target in payload.items():
+            if not isinstance(source, str) or not isinstance(target, str):
+                raise ValueError(
+                    f"Glossary map entries in {path} must be string -> string"
+                )
+            entries.append(GlossaryEntry(source=source, target=target))
+        return entries
+
+    if isinstance(payload, list):
+        for index, raw_entry in enumerate(payload):
+            if not isinstance(raw_entry, dict):
+                raise ValueError(f"Glossary entry #{index + 1} in {path} is not an object")
+
+            source = raw_entry.get("source")
+            target = raw_entry.get("target")
+            if not isinstance(source, str) or not isinstance(target, str):
+                raise ValueError(
+                    f"Glossary entry #{index + 1} in {path} needs string source/target"
+                )
+
+            entries.append(
+                GlossaryEntry(
+                    source=source,
+                    target=target,
+                    case_sensitive=bool(raw_entry.get("case_sensitive", False)),
+                    whole_word=bool(raw_entry.get("whole_word", True)),
+                )
+            )
+        return entries
+
+    raise ValueError(
+        f"Glossary file {path} must contain either an object map or a list of entries"
+    )
+
+
+def exact_glossary_override(text: str, glossary: Glossary) -> Optional[str]:
+    if not glossary.enabled:
+        return None
+
+    prefix, core_text, suffix = split_surrounding_whitespace(text)
+    if not core_text:
+        return None
+
+    for entry in glossary.entries:
+        if entry.case_sensitive:
+            matches = core_text == entry.source
+        else:
+            matches = core_text.casefold() == entry.source.casefold()
+
+        if matches:
+            return prefix + entry.target + suffix
+
+    return None
+
+
+def apply_glossary_postprocessing(
+    text: str,
+    glossary: Glossary,
+) -> Tuple[str, int]:
+    if not glossary.enabled or not text:
+        return text, 0
+
+    result = text
+    replacements = 0
+    for entry in glossary.entries:
+        flags = 0 if entry.case_sensitive else re.IGNORECASE
+        source_pattern = re.escape(entry.source)
+        if entry.whole_word:
+            source_pattern = rf"(?<!\w){source_pattern}(?!\w)"
+
+        result, count = re.subn(source_pattern, entry.target, result, flags=flags)
+        replacements += count
+
+    return result, replacements
+
+
 @dataclass
 class Ct2TranslatorBackend:
     translator: Any
@@ -300,6 +446,8 @@ class TranslationStats:
     cached_translations_used: int = 0
     newly_generated_translations: int = 0
     completed_fields: int = 0
+    glossary_exact_overrides: int = 0
+    glossary_post_replacements: int = 0
 
 
 @dataclass
@@ -646,12 +794,19 @@ def get_cached_or_translate_texts(
     backend: Ct2TranslatorBackend,
     cache: Dict[str, str],
     stats: TranslationStats,
+    glossary: Glossary,
 ) -> Dict[str, str]:
     translated_by_text: Dict[str, str] = {}
     texts_to_translate: List[str] = []
     seen_missing: set[str] = set()
 
     for text in texts:
+        exact_override = exact_glossary_override(text, glossary)
+        if exact_override is not None:
+            translated_by_text[text] = exact_override
+            stats.glossary_exact_overrides += 1
+            continue
+
         cache_key = make_translation_cache_key(
             text,
             backend.tokenizer_model,
@@ -659,8 +814,13 @@ def get_cached_or_translate_texts(
         )
 
         if cache_key in cache:
-            translated_by_text[text] = cache[cache_key]
+            translated_text, replacement_count = apply_glossary_postprocessing(
+                cache[cache_key],
+                glossary,
+            )
+            translated_by_text[text] = translated_text
             stats.cached_translations_used += 1
+            stats.glossary_post_replacements += replacement_count
             continue
 
         if text not in seen_missing:
@@ -680,13 +840,18 @@ def get_cached_or_translate_texts(
         )
 
         for source_text, translated_text in zip(batch, translated_batch):
-            translated_by_text[source_text] = translated_text
             cache_key = make_translation_cache_key(
                 source_text,
                 backend.tokenizer_model,
                 backend.ct2_model_dir,
             )
             cache[cache_key] = translated_text
+            processed_text, replacement_count = apply_glossary_postprocessing(
+                translated_text,
+                glossary,
+            )
+            translated_by_text[source_text] = processed_text
+            stats.glossary_post_replacements += replacement_count
 
         stats.newly_generated_translations += len(batch)
         generated_since_save += len(batch)
@@ -702,7 +867,7 @@ def translate_targets_with_ct2(
     targets: List[TranslationTarget],
     args: argparse.Namespace,
     backend: Optional[Ct2TranslatorBackend] = None,
-) -> Dict[Tuple[str, str, str], str]:
+) -> Tuple[Dict[Tuple[str, str, str], str], TranslationStats]:
     """
     Returns:
       (item_id, item_type, field) -> translated_text
@@ -712,6 +877,7 @@ def translate_targets_with_ct2(
 
     print(f"Loading translation cache: {TRANSLATION_CACHE_FILE}")
     cache = load_translation_cache()
+    glossary = load_glossary(Path(args.glossary_file), args.disable_glossary)
     stats = TranslationStats()
     prepared_targets = [prepare_translation_target(target) for target in targets]
 
@@ -735,6 +901,7 @@ def translate_targets_with_ct2(
         backend=backend,
         cache=cache,
         stats=stats,
+        glossary=glossary,
     )
 
     result: Dict[Tuple[str, str, str], str] = {}
@@ -767,8 +934,10 @@ def translate_targets_with_ct2(
     save_translation_cache(cache)
     print(f"Cached translations used: {stats.cached_translations_used}")
     print(f"Newly generated translations: {stats.newly_generated_translations}")
+    print(f"Glossary exact overrides: {stats.glossary_exact_overrides}")
+    print(f"Glossary post-processing replacements: {stats.glossary_post_replacements}")
 
-    return result
+    return result, stats
 
 
 def patch_miro_item(
@@ -910,6 +1079,61 @@ def delete_miro_item(miro_token: str, board_id: str, item_id: str) -> None:
     )
 
 
+def create_miro_item(
+    miro_token: str,
+    board_id: str,
+    item_type: str,
+    payload: Dict[str, Any],
+) -> Dict[str, Any]:
+    if item_type not in MIRO_UPDATE_ENDPOINTS:
+        raise ApiError(f"Creating Miro item type is not supported: {item_type}")
+
+    endpoint = MIRO_UPDATE_ENDPOINTS[item_type]
+    encoded_board_id = quote(board_id, safe="=")
+    url = f"{MIRO_API_BASE}/boards/{encoded_board_id}/{endpoint}"
+    return request_json(
+        "POST",
+        url,
+        headers=miro_headers(miro_token),
+        json=payload,
+    )
+
+
+def patch_miro_item_payload(
+    miro_token: str,
+    board_id: str,
+    item_id: str,
+    item_type: str,
+    payload: Dict[str, Any],
+) -> None:
+    if item_type not in MIRO_UPDATE_ENDPOINTS:
+        raise ApiError(f"Updating Miro item type is not supported: {item_type}")
+
+    endpoint = MIRO_UPDATE_ENDPOINTS[item_type]
+    encoded_board_id = quote(board_id, safe="=")
+    encoded_item_id = quote(item_id, safe="=")
+    url = f"{MIRO_API_BASE}/boards/{encoded_board_id}/{endpoint}/{encoded_item_id}"
+
+    response = requests.patch(
+        url,
+        headers=miro_headers(miro_token),
+        json=payload,
+        timeout=60,
+    )
+    if response.ok:
+        return
+
+    try:
+        body = response.json()
+    except Exception:
+        body = response.text
+
+    raise ApiError(
+        f"PATCH payload failed for {item_type} {item_id}: "
+        f"HTTP {response.status_code}: {body}"
+    )
+
+
 def is_miro_write_permission_error(body: Any) -> bool:
     if not isinstance(body, dict):
         return False
@@ -962,6 +1186,426 @@ def verify_miro_write_access(
                 print(f"WARNING: {exc}", file=sys.stderr)
 
 
+def sanitize_board_id_for_filename(board_id: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", board_id).strip("_")
+
+
+def default_sync_state_file(source_board_id: str, clone_board_id: str) -> Path:
+    source = sanitize_board_id_for_filename(source_board_id)
+    clone = sanitize_board_id_for_filename(clone_board_id)
+    return Path(f"miro_sync_state_{source}__{clone}.json")
+
+
+def get_sync_state_path(
+    args: argparse.Namespace,
+    source_board_id: str,
+    clone_board_id: str,
+) -> Path:
+    if args.sync_state_file:
+        return Path(args.sync_state_file)
+    return default_sync_state_file(source_board_id, clone_board_id)
+
+
+def load_sync_state(path: Path) -> Dict[str, Any]:
+    try:
+        with path.open("r", encoding="utf-8") as state_file:
+            state = json.load(state_file)
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(f"Sync-state file does not exist: {path}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid sync-state JSON in {path}: {exc}") from exc
+
+    if not isinstance(state, dict) or state.get("version") != SYNC_STATE_VERSION:
+        raise ValueError(f"Unsupported sync-state format in {path}")
+
+    state.setdefault("items", {})
+    return state
+
+
+def save_sync_state(path: Path, state: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with tmp_path.open("w", encoding="utf-8") as state_file:
+        json.dump(state, state_file, ensure_ascii=False, indent=2, sort_keys=True)
+        state_file.write("\n")
+    tmp_path.replace(path)
+
+
+def hash_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def current_timestamp() -> str:
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def supported_item(item: Dict[str, Any]) -> bool:
+    return item.get("type") in TRANSLATABLE_FIELDS
+
+
+def item_by_id(items: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    return {item["id"]: item for item in items if item.get("id")}
+
+
+def rounded_number(value: Any, precision: int) -> Optional[float]:
+    if isinstance(value, (int, float)):
+        return round(float(value), precision)
+    return None
+
+
+def rounded_object_values(value: Any, precision: int) -> Tuple[Tuple[str, Optional[float]], ...]:
+    if not isinstance(value, dict):
+        return ()
+    return tuple(
+        sorted((key, rounded_number(raw_value, precision)) for key, raw_value in value.items())
+    )
+
+
+def stable_json(value: Any) -> str:
+    try:
+        return json.dumps(value or {}, ensure_ascii=False, sort_keys=True)
+    except TypeError:
+        return "{}"
+
+
+def supported_text_values(item: Dict[str, Any]) -> Tuple[Tuple[str, str], ...]:
+    item_type = item.get("type")
+    data = item.get("data") or {}
+    values: List[Tuple[str, str]] = []
+    for field in TRANSLATABLE_FIELDS.get(item_type, []):
+        value = data.get(field)
+        if isinstance(value, str):
+            values.append((field, value))
+    return tuple(values)
+
+
+def item_fingerprint_for_copy_mapping(item: Dict[str, Any]) -> Tuple[Any, ...]:
+    return (
+        item.get("type"),
+        rounded_object_values(item.get("position"), POSITION_PRECISION),
+        rounded_object_values(item.get("geometry"), GEOMETRY_PRECISION),
+        supported_text_values(item),
+        stable_json(item.get("style")),
+    )
+
+
+def item_fingerprint_for_position_mapping(item: Dict[str, Any]) -> Tuple[Any, ...]:
+    return (
+        item.get("type"),
+        rounded_object_values(item.get("position"), POSITION_PRECISION),
+        rounded_object_values(item.get("geometry"), GEOMETRY_PRECISION),
+        stable_json(item.get("style")),
+    )
+
+
+def build_mapping_by_fingerprint(
+    source_items: List[Dict[str, Any]],
+    clone_items: List[Dict[str, Any]],
+    *,
+    include_text: bool,
+) -> Tuple[Dict[str, str], int, int, int]:
+    fingerprint_fn = (
+        item_fingerprint_for_copy_mapping
+        if include_text
+        else item_fingerprint_for_position_mapping
+    )
+    clone_by_fingerprint: Dict[Tuple[Any, ...], List[Dict[str, Any]]] = defaultdict(list)
+    for clone_item in clone_items:
+        if supported_item(clone_item):
+            clone_by_fingerprint[fingerprint_fn(clone_item)].append(clone_item)
+
+    mapping: Dict[str, str] = {}
+    unmatched = 0
+    ambiguous = 0
+
+    for source_item in source_items:
+        if not supported_item(source_item) or not source_item.get("id"):
+            continue
+
+        candidates = clone_by_fingerprint.get(fingerprint_fn(source_item), [])
+        if len(candidates) == 1 and candidates[0].get("id"):
+            mapping[source_item["id"]] = candidates[0]["id"]
+        elif len(candidates) > 1:
+            ambiguous += 1
+        else:
+            unmatched += 1
+
+    clone_ids = set(mapping.values())
+    unmatched_clone = sum(
+        1
+        for clone_item in clone_items
+        if supported_item(clone_item) and clone_item.get("id") not in clone_ids
+    )
+    return mapping, unmatched, unmatched_clone, ambiguous
+
+
+def build_source_to_clone_mapping_after_copy(
+    source_items: List[Dict[str, Any]],
+    clone_items: List[Dict[str, Any]],
+) -> Tuple[Dict[str, str], int, int, int]:
+    return build_mapping_by_fingerprint(source_items, clone_items, include_text=True)
+
+
+def make_empty_sync_state(source_board_id: str, clone_board_id: str) -> Dict[str, Any]:
+    now = current_timestamp()
+    return {
+        "version": SYNC_STATE_VERSION,
+        "source_board_id": source_board_id,
+        "clone_board_id": clone_board_id,
+        "created_at": now,
+        "updated_at": now,
+        "items": {},
+    }
+
+
+def sync_state_entry_for_item(
+    source_item: Dict[str, Any],
+    clone_item_id: str,
+    *,
+    translated_hashes: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    item_type = source_item.get("type")
+    data = source_item.get("data") or {}
+    source_hashes: Dict[str, str] = {}
+    for field in TRANSLATABLE_FIELDS.get(item_type, []):
+        value = data.get(field)
+        if isinstance(value, str):
+            source_hashes[field] = hash_text(value)
+
+    return {
+        "clone_item_id": clone_item_id,
+        "item_type": item_type,
+        "last_source_text_hash_by_field": source_hashes,
+        "last_translated_text_hash_by_field": translated_hashes or {},
+        "last_seen": current_timestamp(),
+    }
+
+
+def create_sync_state_from_mapping(
+    source_board_id: str,
+    clone_board_id: str,
+    source_items: List[Dict[str, Any]],
+    mapping: Dict[str, str],
+) -> Dict[str, Any]:
+    state = make_empty_sync_state(source_board_id, clone_board_id)
+    source_lookup = item_by_id(source_items)
+    for source_item_id, clone_item_id in mapping.items():
+        source_item = source_lookup.get(source_item_id)
+        if source_item:
+            state["items"][source_item_id] = sync_state_entry_for_item(
+                source_item,
+                clone_item_id,
+            )
+    return state
+
+
+def initialize_sync_state_from_existing_clone(
+    source_board_id: str,
+    clone_board_id: str,
+    source_items: List[Dict[str, Any]],
+    clone_items: List[Dict[str, Any]],
+    args: argparse.Namespace,
+) -> Tuple[Dict[str, Any], int, int, int]:
+    mapping, unmatched_source, unmatched_clone, ambiguous = build_mapping_by_fingerprint(
+        source_items,
+        clone_items,
+        include_text=False,
+    )
+
+    supported_source_count = sum(1 for item in source_items if supported_item(item))
+    quality = len(mapping) / supported_source_count if supported_source_count else 1.0
+    print("Sync-state initialization report:")
+    print(f"  Mapped items: {len(mapping)}")
+    print(f"  Unmatched source items: {unmatched_source}")
+    print(f"  Unmatched clone items: {unmatched_clone}")
+    print(f"  Ambiguous source items: {ambiguous}")
+    print(f"  Mapping quality: {quality:.1%}")
+
+    if quality < LOW_MAPPING_QUALITY_THRESHOLD and not args.force_initialize_sync_state:
+        raise RuntimeError(
+            "Sync-state initialization mapping quality is suspiciously low. "
+            "Review board layout and rerun with --force-initialize-sync-state if "
+            "you accept this best-effort mapping."
+        )
+
+    state = create_sync_state_from_mapping(
+        source_board_id,
+        clone_board_id,
+        source_items,
+        mapping,
+    )
+    return state, unmatched_source, unmatched_clone, ambiguous
+
+
+def build_item_payload_from_source(
+    source_item: Dict[str, Any],
+    translated_fields: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {}
+    data = dict(source_item.get("data") or {})
+    for field, value in (translated_fields or {}).items():
+        data[field] = value
+
+    if data:
+        payload["data"] = data
+
+    for top_level_key in ("position", "geometry", "style"):
+        value = source_item.get(top_level_key)
+        if isinstance(value, dict) and value:
+            payload[top_level_key] = value
+
+    return payload
+
+
+def translated_fields_for_item(
+    item_id: str,
+    item_type: str,
+    translations: Dict[Tuple[str, str, str], str],
+) -> Dict[str, str]:
+    result: Dict[str, str] = {}
+    for field in TRANSLATABLE_FIELDS.get(item_type, []):
+        key = (item_id, item_type, field)
+        if key in translations:
+            result[field] = translations[key]
+    return result
+
+
+def update_sync_state_entry_hashes(
+    state: Dict[str, Any],
+    source_item: Dict[str, Any],
+    clone_item_id: str,
+    translated_fields: Dict[str, str],
+) -> None:
+    translated_hashes = {
+        field: hash_text(value) for field, value in translated_fields.items()
+    }
+    state["items"][source_item["id"]] = sync_state_entry_for_item(
+        source_item,
+        clone_item_id,
+        translated_hashes=translated_hashes,
+    )
+
+
+def create_clone_item_from_source_item(
+    miro_token: str,
+    clone_board_id: str,
+    source_item: Dict[str, Any],
+    translated_fields: Dict[str, str],
+    *,
+    dry_run: bool,
+) -> Optional[str]:
+    source_item_id = source_item.get("id", "<unknown>")
+    item_type = source_item.get("type")
+    if item_type not in MIRO_UPDATE_ENDPOINTS:
+        print(f"WARNING: Cannot create unsupported item type {item_type} ({source_item_id})")
+        return None
+
+    payload = build_item_payload_from_source(source_item, translated_fields)
+    if dry_run:
+        print(f"[DRY RUN] Would create {item_type} from source item {source_item_id}")
+        return "__dry_run_clone_item__"
+
+    try:
+        created_item = create_miro_item(
+            miro_token=miro_token,
+            board_id=clone_board_id,
+            item_type=item_type,
+            payload=payload,
+        )
+    except Exception as exc:
+        print(
+            f"WARNING: Creating clone item for source {source_item_id} failed: {exc}",
+            file=sys.stderr,
+        )
+        return None
+
+    clone_item_id = created_item.get("id")
+    if not clone_item_id:
+        print(
+            f"WARNING: Created {item_type} from source {source_item_id}, "
+            "but Miro response did not include an id.",
+            file=sys.stderr,
+        )
+        return None
+
+    return clone_item_id
+
+
+def update_clone_item_from_source_item(
+    miro_token: str,
+    clone_board_id: str,
+    source_item: Dict[str, Any],
+    clone_item_id: str,
+    translated_fields: Dict[str, str],
+    *,
+    update_layout: bool,
+    dry_run: bool,
+) -> bool:
+    item_type = source_item.get("type")
+    if item_type not in MIRO_UPDATE_ENDPOINTS:
+        print(f"WARNING: Cannot update unsupported item type {item_type}")
+        return False
+
+    if dry_run:
+        layout_text = " with layout" if update_layout else ""
+        print(f"[DRY RUN] Would update {item_type} {clone_item_id}{layout_text}")
+        return True
+
+    if update_layout:
+        payload = build_item_payload_from_source(source_item, translated_fields)
+        try:
+            patch_miro_item_payload(
+                miro_token=miro_token,
+                board_id=clone_board_id,
+                item_id=clone_item_id,
+                item_type=item_type,
+                payload=payload,
+            )
+            return True
+        except Exception as exc:
+            print(
+                f"WARNING: Layout update failed for {item_type} {clone_item_id}; "
+                f"falling back to text-only update: {exc}",
+                file=sys.stderr,
+            )
+
+    if not translated_fields:
+        print(
+            f"WARNING: No translated fields available for {item_type} {clone_item_id}; "
+            "skipping text-only fallback.",
+            file=sys.stderr,
+        )
+        return False
+
+    patch_miro_item(
+        miro_token=miro_token,
+        board_id=clone_board_id,
+        item_id=clone_item_id,
+        item_type=item_type,
+        data_update=translated_fields,
+    )
+    return True
+
+
+def delete_clone_item(
+    miro_token: str,
+    clone_board_id: str,
+    clone_item_id: str,
+    *,
+    dry_run: bool,
+) -> bool:
+    if dry_run:
+        print(f"[DRY RUN] Would delete clone item {clone_item_id}")
+        return True
+
+    try:
+        delete_miro_item(miro_token, clone_board_id, clone_item_id)
+        return True
+    except Exception as exc:
+        print(f"WARNING: Deleting clone item {clone_item_id} failed: {exc}", file=sys.stderr)
+        return False
+
+
 def apply_translations_to_miro(
     miro_token: str,
     board_id: str,
@@ -1008,6 +1652,444 @@ def make_default_clone_name(prefix: str) -> str:
     return name[:60]
 
 
+def print_item_counts(targets: List[TranslationTarget]) -> None:
+    counts_by_type = defaultdict(int)
+    for target in targets:
+        counts_by_type[target.item_type] += 1
+
+    print(f"Found {len(targets)} translatable text fields.")
+    for item_type, count in sorted(counts_by_type.items()):
+        print(f"  {item_type}: {count}")
+
+
+def count_unsupported_items(items: List[Dict[str, Any]]) -> Counter:
+    return Counter(
+        item.get("type", "<unknown>")
+        for item in items
+        if item.get("type") not in TRANSLATABLE_FIELDS
+    )
+
+
+def print_unsupported_item_counts(items: List[Dict[str, Any]]) -> int:
+    counts = count_unsupported_items(items)
+    total = sum(counts.values())
+    if total:
+        print(f"Unsupported items skipped: {total}")
+        for item_type, count in sorted(counts.items()):
+            print(f"  {item_type}: {count}")
+    return total
+
+
+def print_run_summary(report: SyncReport) -> None:
+    print()
+    print("Summary")
+    print(f"Mode: {report.mode}")
+    print(f"Source board id: {report.source_board_id}")
+    print(f"Clone board id: {report.clone_board_id}")
+    print(f"Translatable source fields: {report.translatable_source_fields}")
+    print(f"Mapped items updated: {report.mapped_items_updated}")
+    print(f"New clone items created: {report.new_clone_items_created}")
+    print(f"Stale clone items detected: {report.stale_clone_items_detected}")
+    print(f"Stale clone items deleted: {report.stale_clone_items_deleted}")
+    print(f"Unsupported items skipped: {report.unsupported_items_skipped}")
+    print(f"Cached translations used: {report.cached_translations_used}")
+    print(f"Newly generated translations: {report.newly_generated_translations}")
+    print(f"Glossary exact overrides: {report.glossary_exact_overrides}")
+    print(f"Glossary post-processing replacements: {report.glossary_post_replacements}")
+    if report.sync_state_file:
+        print(f"Sync-state file: {report.sync_state_file}")
+
+
+def update_report_from_translation_stats(
+    report: SyncReport,
+    stats: TranslationStats,
+) -> None:
+    report.cached_translations_used = stats.cached_translations_used
+    report.newly_generated_translations = stats.newly_generated_translations
+    report.glossary_exact_overrides = stats.glossary_exact_overrides
+    report.glossary_post_replacements = stats.glossary_post_replacements
+
+
+def run_rebuild_mode(
+    args: argparse.Namespace,
+    miro_token: str,
+    translation_backend: Ct2TranslatorBackend,
+) -> int:
+    source_board_id = extract_board_id(args.source_board)
+    clone_name = args.clone_name or make_default_clone_name(args.clone_prefix)
+
+    print(f"Source board: {source_board_id}")
+    print(f"Creating clone: {clone_name}")
+
+    clone = copy_board(
+        miro_token=miro_token,
+        source_board_id=source_board_id,
+        clone_name=clone_name,
+        target_team_id=args.target_team_id,
+    )
+
+    clone_board_id = clone.get("id")
+    if not clone_board_id:
+        raise ApiError(f"Miro copy response did not contain board id: {clone}")
+
+    print(f"Clone board id: {clone_board_id}")
+    view_link = (
+        clone.get("viewLink")
+        or clone.get("links", {}).get("self")
+        or clone.get("links", {}).get("related")
+    )
+    if view_link:
+        print(f"Clone link: {view_link}")
+
+    if args.sleep_after_copy > 0:
+        print(f"Waiting {args.sleep_after_copy}s for board copy to settle...")
+        time.sleep(args.sleep_after_copy)
+
+    print("Reading items from source board...")
+    source_items = get_all_items(miro_token=miro_token, board_id=source_board_id)
+    print(f"Found {len(source_items)} items in source.")
+
+    print("Reading items from cloned board...")
+    clone_items = get_all_items(miro_token=miro_token, board_id=clone_board_id)
+    print(f"Found {len(clone_items)} items in clone.")
+
+    sync_state_path = get_sync_state_path(args, source_board_id, clone_board_id)
+    mapping, unmatched_source, unmatched_clone, ambiguous = (
+        build_source_to_clone_mapping_after_copy(source_items, clone_items)
+    )
+    print(f"Mapped source items to cloned items: {len(mapping)}")
+    if unmatched_source or unmatched_clone or ambiguous:
+        print(
+            "WARNING: Sync-state mapping was incomplete: "
+            f"{unmatched_source} unmatched source, {unmatched_clone} unmatched clone, "
+            f"{ambiguous} ambiguous source items.",
+            file=sys.stderr,
+        )
+
+    sync_state = create_sync_state_from_mapping(
+        source_board_id,
+        clone_board_id,
+        source_items,
+        mapping,
+    )
+    save_sync_state(sync_state_path, sync_state)
+    print(f"Saved sync-state file: {sync_state_path}")
+
+    targets = collect_translation_targets(clone_items)
+    print_item_counts(targets)
+
+    report = SyncReport(
+        mode="rebuild",
+        source_board_id=source_board_id,
+        clone_board_id=clone_board_id,
+        sync_state_file=sync_state_path,
+        translatable_source_fields=len(targets),
+        unsupported_items_skipped=print_unsupported_item_counts(source_items),
+        unmapped_source_items=unmatched_source,
+        ambiguous_items=ambiguous,
+    )
+
+    if not targets:
+        print("No translatable fields found.")
+        print_run_summary(report)
+        return 0
+
+    if args.dry_run:
+        print("[DRY RUN] Skipping Miro write-access preflight item create/update/delete.")
+    else:
+        verify_miro_write_access(miro_token=miro_token, board_id=clone_board_id)
+
+    translations, stats = translate_targets_with_ct2(
+        targets=targets,
+        args=args,
+        backend=translation_backend,
+    )
+    update_report_from_translation_stats(report, stats)
+
+    updated = apply_translations_to_miro(
+        miro_token=miro_token,
+        board_id=clone_board_id,
+        translations=translations,
+        dry_run=args.dry_run,
+    )
+    report.updated_miro_items = updated
+    report.mapped_items_updated = updated
+
+    source_lookup = item_by_id(source_items)
+    for source_item_id, entry in sync_state.get("items", {}).items():
+        source_item = source_lookup.get(source_item_id)
+        if not source_item:
+            continue
+        clone_item_id = entry.get("clone_item_id")
+        item_type = source_item.get("type")
+        if not clone_item_id or not item_type:
+            continue
+        translated_fields = translated_fields_for_item(
+            clone_item_id,
+            item_type,
+            translations,
+        )
+        update_sync_state_entry_hashes(
+            sync_state,
+            source_item,
+            clone_item_id,
+            translated_fields,
+        )
+
+    sync_state["updated_at"] = current_timestamp()
+    save_sync_state(sync_state_path, sync_state)
+
+    print()
+    print("Done.")
+    print(f"English clone board id: {clone_board_id}")
+    if view_link:
+        print(f"English clone link: {view_link}")
+    print_run_summary(report)
+    return 0
+
+
+def build_update_translation_targets(
+    source_items: List[Dict[str, Any]],
+    clone_items: List[Dict[str, Any]],
+    sync_state: Dict[str, Any],
+) -> Tuple[List[TranslationTarget], List[Tuple[Dict[str, Any], str]], List[Dict[str, Any]], List[str]]:
+    source_lookup = item_by_id(source_items)
+    clone_lookup = item_by_id(clone_items)
+
+    targets: List[TranslationTarget] = []
+    mapped_items: List[Tuple[Dict[str, Any], str]] = []
+    stale_source_ids: List[str] = []
+
+    for source_item_id, entry in sync_state.get("items", {}).items():
+        source_item = source_lookup.get(source_item_id)
+        clone_item_id = entry.get("clone_item_id")
+        if not source_item:
+            stale_source_ids.append(source_item_id)
+            continue
+        if not clone_item_id or clone_item_id not in clone_lookup:
+            print(
+                f"WARNING: Mapped clone item missing for source {source_item_id}: "
+                f"{clone_item_id}",
+                file=sys.stderr,
+            )
+            continue
+        if not supported_item(source_item):
+            continue
+
+        mapped_items.append((source_item, clone_item_id))
+        data = source_item.get("data") or {}
+        item_type = source_item.get("type")
+        for field in TRANSLATABLE_FIELDS.get(item_type, []):
+            value = data.get(field)
+            if isinstance(value, str) and is_probably_translatable(value):
+                targets.append(
+                    TranslationTarget(
+                        item_id=clone_item_id,
+                        item_type=item_type,
+                        field=field,
+                        source_text=value,
+                        is_html=looks_like_html(value),
+                    )
+                )
+
+    mapped_source_ids = set(sync_state.get("items", {}).keys())
+    new_source_items = [
+        item
+        for item in source_items
+        if supported_item(item) and item.get("id") not in mapped_source_ids
+    ]
+
+    for source_item in new_source_items:
+        data = source_item.get("data") or {}
+        item_type = source_item.get("type")
+        source_item_id = source_item.get("id")
+        if not source_item_id:
+            continue
+        for field in TRANSLATABLE_FIELDS.get(item_type, []):
+            value = data.get(field)
+            if isinstance(value, str) and is_probably_translatable(value):
+                targets.append(
+                    TranslationTarget(
+                        item_id=source_item_id,
+                        item_type=item_type,
+                        field=field,
+                        source_text=value,
+                        is_html=looks_like_html(value),
+                    )
+                )
+
+    return targets, mapped_items, new_source_items, stale_source_ids
+
+
+def run_update_existing_clone_mode(
+    args: argparse.Namespace,
+    miro_token: str,
+    translation_backend: Ct2TranslatorBackend,
+) -> int:
+    source_board_id = extract_board_id(args.source_board)
+    if not args.clone_board:
+        raise ValueError("--clone-board is required with --update-existing-clone")
+    clone_board_id = extract_board_id(args.clone_board)
+    sync_state_path = get_sync_state_path(args, source_board_id, clone_board_id)
+
+    print(f"Source board: {source_board_id}")
+    print(f"Existing clone board: {clone_board_id}")
+
+    print("Reading items from source board...")
+    source_items = get_all_items(miro_token=miro_token, board_id=source_board_id)
+    print(f"Found {len(source_items)} items in source.")
+
+    print("Reading items from existing clone board...")
+    clone_items = get_all_items(miro_token=miro_token, board_id=clone_board_id)
+    print(f"Found {len(clone_items)} items in clone.")
+
+    report = SyncReport(
+        mode="update-existing-clone",
+        source_board_id=source_board_id,
+        clone_board_id=clone_board_id,
+        sync_state_file=sync_state_path,
+        unsupported_items_skipped=print_unsupported_item_counts(source_items),
+    )
+
+    if sync_state_path.exists():
+        sync_state = load_sync_state(sync_state_path)
+    else:
+        if not args.initialize_sync_state:
+            raise FileNotFoundError(
+                "Update mode needs a sync-state file. Run rebuild mode once, "
+                "provide --sync-state-file, or rerun with --initialize-sync-state "
+                "to create a best-effort mapping for an existing translated clone."
+            )
+
+        sync_state, unmatched_source, unmatched_clone, ambiguous = (
+            initialize_sync_state_from_existing_clone(
+                source_board_id,
+                clone_board_id,
+                source_items,
+                clone_items,
+                args,
+            )
+        )
+        report.unmapped_source_items = unmatched_source
+        report.ambiguous_items = ambiguous
+        save_sync_state(sync_state_path, sync_state)
+        print(f"Saved initialized sync-state file: {sync_state_path}")
+        print("Initialization complete. Review the state file, then rerun update mode.")
+        print_run_summary(report)
+        return 0
+
+    if sync_state.get("source_board_id") != source_board_id:
+        raise ValueError("Sync-state source_board_id does not match --source-board")
+    if sync_state.get("clone_board_id") != clone_board_id:
+        raise ValueError("Sync-state clone_board_id does not match --clone-board")
+
+    targets, mapped_items, new_source_items, stale_source_ids = (
+        build_update_translation_targets(source_items, clone_items, sync_state)
+    )
+    report.translatable_source_fields = len(targets)
+    report.stale_clone_items_detected = len(stale_source_ids)
+
+    print_item_counts(targets)
+    if stale_source_ids:
+        print(f"Stale mapped source items detected: {len(stale_source_ids)}")
+    if new_source_items:
+        print(f"New supported source items without mapping: {len(new_source_items)}")
+
+    if args.dry_run:
+        print("[DRY RUN] Skipping Miro write-access preflight item create/update/delete.")
+    else:
+        verify_miro_write_access(miro_token=miro_token, board_id=clone_board_id)
+
+    if targets:
+        translations, stats = translate_targets_with_ct2(
+            targets=targets,
+            args=args,
+            backend=translation_backend,
+        )
+        update_report_from_translation_stats(report, stats)
+    else:
+        translations = {}
+
+    for source_item, clone_item_id in mapped_items:
+        translated_fields = translated_fields_for_item(
+            clone_item_id,
+            source_item.get("type"),
+            translations,
+        )
+        if update_clone_item_from_source_item(
+            miro_token,
+            clone_board_id,
+            source_item,
+            clone_item_id,
+            translated_fields,
+            update_layout=args.update_layout,
+            dry_run=args.dry_run,
+        ):
+            report.mapped_items_updated += 1
+            if not args.dry_run:
+                update_sync_state_entry_hashes(
+                    sync_state,
+                    source_item,
+                    clone_item_id,
+                    translated_fields,
+                )
+
+    for source_item in new_source_items:
+        source_item_id = source_item.get("id")
+        translated_fields = translated_fields_for_item(
+            source_item_id,
+            source_item.get("type"),
+            translations,
+        )
+        clone_item_id = create_clone_item_from_source_item(
+            miro_token,
+            clone_board_id,
+            source_item,
+            translated_fields,
+            dry_run=args.dry_run,
+        )
+        if clone_item_id:
+            report.new_clone_items_created += 1
+            if not args.dry_run:
+                update_sync_state_entry_hashes(
+                    sync_state,
+                    source_item,
+                    clone_item_id,
+                    translated_fields,
+                )
+
+    if stale_source_ids:
+        for stale_source_id in stale_source_ids:
+            entry = sync_state.get("items", {}).get(stale_source_id) or {}
+            clone_item_id = entry.get("clone_item_id")
+            if not clone_item_id:
+                continue
+            if args.delete_missing_items:
+                if delete_clone_item(
+                    miro_token,
+                    clone_board_id,
+                    clone_item_id,
+                    dry_run=args.dry_run,
+                ):
+                    report.stale_clone_items_deleted += 1
+                    if not args.dry_run:
+                        sync_state["items"].pop(stale_source_id, None)
+            else:
+                print(
+                    f"Stale source item {stale_source_id} maps to clone item "
+                    f"{clone_item_id}; not deleting without --delete-missing-items."
+                )
+
+    if not args.dry_run:
+        sync_state["updated_at"] = current_timestamp()
+        save_sync_state(sync_state_path, sync_state)
+
+    print()
+    print("Done.")
+    print_run_summary(report)
+    return 0
+
+
 def main() -> int:
     load_dotenv()
 
@@ -1033,6 +2115,48 @@ def main() -> int:
         "--target-team-id",
         default=None,
         help="Optional Miro team id where the cloned board should be created.",
+    )
+    parser.add_argument(
+        "--update-existing-clone",
+        action="store_true",
+        help="Update an existing translated clone instead of creating a new clone.",
+    )
+    parser.add_argument(
+        "--clone-board",
+        default=None,
+        help="Existing translated clone board id or URL, required for update mode.",
+    )
+    parser.add_argument(
+        "--sync-state-file",
+        default=None,
+        help="Path to the sync-state JSON file. Defaults to a deterministic filename.",
+    )
+    parser.add_argument(
+        "--initialize-sync-state",
+        action="store_true",
+        help="Initialize sync-state for an existing translated clone and exit.",
+    )
+    parser.add_argument(
+        "--force-initialize-sync-state",
+        action="store_true",
+        help="Allow low-confidence sync-state initialization.",
+    )
+    parser.add_argument(
+        "--delete-missing-items",
+        action="store_true",
+        help="Delete mapped clone items whose source items no longer exist.",
+    )
+    parser.add_argument(
+        "--update-layout",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Update position/geometry/style in update mode when supported.",
+    )
+    parser.add_argument(
+        "--sync-supported-items-only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Only sync supported translatable item types. Default: true.",
     )
     parser.add_argument(
         "--source-lang",
@@ -1089,6 +2213,16 @@ def main() -> int:
         help="Number of plain text units translated per CTranslate2 batch.",
     )
     parser.add_argument(
+        "--glossary-file",
+        default=DEFAULT_GLOSSARY_FILE,
+        help=f"Glossary JSON file. Default: {DEFAULT_GLOSSARY_FILE}",
+    )
+    parser.add_argument(
+        "--disable-glossary",
+        action="store_true",
+        help="Disable glossary exact overrides and post-processing.",
+    )
+    parser.add_argument(
         "--sleep-after-copy",
         type=float,
         default=3.0,
@@ -1115,90 +2249,41 @@ def main() -> int:
         print("--translation-batch-size must be at least 1", file=sys.stderr)
         return 2
 
+    if args.update_existing_clone and not args.clone_board:
+        print("--clone-board is required with --update-existing-clone", file=sys.stderr)
+        return 2
+
+    if args.update_existing_clone and not args.initialize_sync_state:
+        source_board_id = extract_board_id(args.source_board)
+        clone_board_id = extract_board_id(args.clone_board)
+        sync_state_path = get_sync_state_path(args, source_board_id, clone_board_id)
+        if not sync_state_path.exists():
+            print(
+                "Update mode needs a sync-state file. Run rebuild mode once, "
+                "provide --sync-state-file, or rerun with --initialize-sync-state "
+                "to create a best-effort mapping for an existing translated clone.\n"
+                f"Expected sync-state file: {sync_state_path}",
+                file=sys.stderr,
+            )
+            return 2
+
+    if not args.sync_supported_items_only:
+        print(
+            "WARNING: Unsupported Miro item types are still skipped for safety; "
+            "--no-sync-supported-items-only is accepted for compatibility only.",
+            file=sys.stderr,
+        )
+
     translation_backend: Optional[Ct2TranslatorBackend] = None
     if args.translator == "ct2":
         translation_backend = verify_ct2_backend_available(args)
     else:
         raise ValueError(f"Unsupported translator backend: {args.translator}")
 
-    source_board_id = extract_board_id(args.source_board)
-    clone_name = args.clone_name or make_default_clone_name(args.clone_prefix)
+    if args.update_existing_clone:
+        return run_update_existing_clone_mode(args, miro_token, translation_backend)
 
-    print(f"Source board: {source_board_id}")
-    print(f"Creating clone: {clone_name}")
-
-    clone = copy_board(
-        miro_token=miro_token,
-        source_board_id=source_board_id,
-        clone_name=clone_name,
-        target_team_id=args.target_team_id,
-    )
-
-    clone_board_id = clone.get("id")
-    if not clone_board_id:
-        raise ApiError(f"Miro copy response did not contain board id: {clone}")
-
-    print(f"Clone board id: {clone_board_id}")
-
-    view_link = (
-        clone.get("viewLink")
-        or clone.get("links", {}).get("self")
-        or clone.get("links", {}).get("related")
-    )
-    if view_link:
-        print(f"Clone link: {view_link}")
-
-    if args.sleep_after_copy > 0:
-        print(f"Waiting {args.sleep_after_copy}s for board copy to settle...")
-        time.sleep(args.sleep_after_copy)
-
-    print("Reading items from cloned board...")
-    items = get_all_items(miro_token=miro_token, board_id=clone_board_id)
-
-    print(f"Found {len(items)} items in clone.")
-
-    targets = collect_translation_targets(items)
-
-    counts_by_type = defaultdict(int)
-    for target in targets:
-        counts_by_type[target.item_type] += 1
-
-    print(f"Found {len(targets)} translatable text fields.")
-    for item_type, count in sorted(counts_by_type.items()):
-        print(f"  {item_type}: {count}")
-
-    if not targets:
-        print("No translatable fields found.")
-        return 0
-
-    verify_miro_write_access(
-        miro_token=miro_token,
-        board_id=clone_board_id,
-    )
-
-    translations = translate_targets_with_ct2(
-        targets=targets,
-        args=args,
-        backend=translation_backend,
-    )
-
-    updated = apply_translations_to_miro(
-        miro_token=miro_token,
-        board_id=clone_board_id,
-        translations=translations,
-        dry_run=args.dry_run,
-    )
-
-    print()
-    print("Done.")
-    print(f"Translated fields: {len(translations)}")
-    print(f"Updated Miro items: {updated}")
-    print(f"English clone board id: {clone_board_id}")
-
-    if view_link:
-        print(f"English clone link: {view_link}")
-
-    return 0
+    return run_rebuild_mode(args, miro_token, translation_backend)
 
 
 if __name__ == "__main__":
