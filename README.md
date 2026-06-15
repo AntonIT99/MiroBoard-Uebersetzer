@@ -65,6 +65,22 @@ MIRO_ACCESS_TOKEN=dein_miro_oauth_access_token
 DEEPL_AUTH_KEY=dein_deepl_api_key
 ```
 
+Der Miro-Token muss zu einem Miro-Nutzer gehören, der den geklonten Board bearbeiten
+kann. Außerdem muss die Miro-App/API-Autorisierung Schreibrechte für Boards haben.
+Wenn Miro beim Zurückschreiben `insufficientPermissions` meldet, den Klon mit genau
+diesem Miro-Nutzer öffnen und prüfen, ob Elemente manuell bearbeitet werden können.
+Falls nicht, App neu autorisieren bzw. den Board in einem Team klonen, in dem die App
+installiert ist und der Nutzer Bearbeitungsrechte hat.
+
+Das Script prüft diese Schreibrechte direkt nach dem Klonen mit einem temporären
+Test-Shape. Erst wenn Erstellen, Aktualisieren und Löschen dieses Test-Elements
+funktionieren, werden Board-Items gelesen und DeepL-Übersetzungen gestartet.
+
+Optional kann mit `--target-team-id` gesteuert werden, in welchem Miro-Team der
+geklonte Board erstellt wird. Der Token-Nutzer und die Miro-App müssen auch in
+diesem Ziel-Team die nötigen Rechte haben. Ohne `--target-team-id` entscheidet
+Miro anhand des Token-/Account-Kontexts, in welchem Team der Klon landet.
+
 Für DeepL Free wird normalerweise automatisch die Free-API-URL verwendet, wenn der API-Key auf `:fx` endet.
 
 Optional kann die DeepL-API-URL manuell gesetzt werden:
@@ -113,6 +129,15 @@ python translate_miro_board.py `
   --source-board "uXjVDEINBOARDID=" `
   --clone-name "[EN] Mein Workshop" `
   --target-lang "EN-US"
+```
+
+### Klon in einem bestimmten Miro-Team erstellen
+
+```powershell
+python translate_miro_board.py `
+  --source-board "uXjVDEINBOARDID=" `
+  --clone-name "[EN] Mein Workshop" `
+  --target-team-id "DEIN_MIRO_TEAM_ID"
 ```
 
 ### Sprache automatisch erkennen lassen

@@ -49,6 +49,14 @@ class ApiError(RuntimeError):
     pass
 
 
+class MiroWritePermissionError(ApiError):
+    pass
+
+
+class MiroPreflightCleanupError(ApiError):
+    pass
+
+
 def extract_board_id(value: str) -> str:
     """
     Accepts either a raw Miro board id like:
@@ -152,12 +160,20 @@ def deepl_headers(auth_key: str) -> Dict[str, str]:
     }
 
 
-def copy_board(miro_token: str, source_board_id: str, clone_name: str) -> Dict[str, Any]:
+def copy_board(
+    miro_token: str,
+    source_board_id: str,
+    clone_name: str,
+    *,
+    target_team_id: Optional[str],
+) -> Dict[str, Any]:
     encoded_board_id = quote(source_board_id, safe="=")
 
     url = f"{MIRO_API_BASE}/boards"
     params = {"copy_from": encoded_board_id}
     payload = {"name": clone_name}
+    if target_team_id:
+        payload["teamId"] = target_team_id
 
     return request_json(
         "PUT",
@@ -400,9 +416,143 @@ def patch_miro_item(
     except Exception:
         body = response.text
 
+    if response.status_code == 403 and is_miro_write_permission_error(body):
+        raise MiroWritePermissionError(
+            "Miro refused item updates on the cloned board. The access token can "
+            "copy/read the board, but its Miro user or OAuth app is not authorized "
+            "to edit widgets on that board. Open the clone with the same Miro user "
+            "that authorized the token and confirm it can manually edit items; if "
+            "needed, reauthorize the app with board write permissions or copy the "
+            "board into a team where the app is installed."
+        )
+
     raise ApiError(
         f"PATCH failed for {item_type} {item_id}: HTTP {response.status_code}: {body}"
     )
+
+
+def create_miro_preflight_shape(miro_token: str, board_id: str) -> str:
+    encoded_board_id = quote(board_id, safe="=")
+    url = f"{MIRO_API_BASE}/boards/{encoded_board_id}/shapes"
+    payload = {
+        "data": {
+            "content": "__miro_translation_permission_check__",
+            "shape": "rectangle",
+        },
+        "position": {
+            "x": -100000,
+            "y": -100000,
+        },
+        "geometry": {
+            "width": 10,
+            "height": 10,
+        },
+    }
+
+    response = requests.post(
+        url,
+        headers=miro_headers(miro_token),
+        json=payload,
+        timeout=60,
+    )
+
+    if response.ok:
+        body = response.json()
+        item_id = body.get("id")
+        if not item_id:
+            raise ApiError(f"Miro preflight shape response did not contain id: {body}")
+        return item_id
+
+    try:
+        body = response.json()
+    except Exception:
+        body = response.text
+
+    if response.status_code == 403 and is_miro_write_permission_error(body):
+        raise MiroWritePermissionError(
+            "Miro refused creating a test item on the cloned board. The access "
+            "token can copy/read the board, but its Miro user or OAuth app is not "
+            "authorized to edit widgets on that board. Reauthorize the app with "
+            "board write permissions or copy the board into a team where the app "
+            "is installed and the token user is an editor."
+        )
+
+    raise ApiError(
+        f"Creating Miro preflight shape failed with HTTP {response.status_code}: {body}"
+    )
+
+
+def delete_miro_item(miro_token: str, board_id: str, item_id: str) -> None:
+    encoded_board_id = quote(board_id, safe="=")
+    encoded_item_id = quote(item_id, safe="=")
+    url = f"{MIRO_API_BASE}/boards/{encoded_board_id}/items/{encoded_item_id}"
+
+    response = requests.delete(url, headers=miro_headers(miro_token), timeout=60)
+
+    if response.ok:
+        return
+
+    try:
+        body = response.json()
+    except Exception:
+        body = response.text
+
+    raise MiroPreflightCleanupError(
+        f"Deleting Miro preflight item {item_id} failed with "
+        f"HTTP {response.status_code}: {body}"
+    )
+
+
+def is_miro_write_permission_error(body: Any) -> bool:
+    if not isinstance(body, dict):
+        return False
+
+    message = str(body.get("message", "")).lower()
+    code = str(body.get("code", "")).lower()
+
+    return code == "insufficientpermissions" and (
+        "update widgets" in message or "authorized" in message
+    )
+
+
+def verify_miro_write_access(
+    miro_token: str,
+    board_id: str,
+) -> None:
+    """
+    Performs a cheap create/update/delete cycle before reading all board items or
+    calling DeepL. This catches widget write permission problems as early as the
+    Miro API allows.
+    """
+    print("Checking Miro write access on cloned board...")
+    preflight_item_id: Optional[str] = None
+
+    try:
+        preflight_item_id = create_miro_preflight_shape(
+            miro_token=miro_token,
+            board_id=board_id,
+        )
+        patch_miro_item(
+            miro_token=miro_token,
+            board_id=board_id,
+            item_id=preflight_item_id,
+            item_type="shape",
+            data_update={"content": "__miro_translation_permission_check_ok__"},
+            try_flat_fallback=False,
+        )
+    finally:
+        if preflight_item_id:
+            original_error = sys.exc_info()[0]
+            try:
+                delete_miro_item(
+                    miro_token=miro_token,
+                    board_id=board_id,
+                    item_id=preflight_item_id,
+                )
+            except MiroPreflightCleanupError as exc:
+                if original_error is None:
+                    raise
+                print(f"WARNING: {exc}", file=sys.stderr)
 
 
 def apply_translations_to_miro(
@@ -473,6 +623,11 @@ def main() -> int:
         help='Used if --clone-name is omitted. Default: "[EN]"',
     )
     parser.add_argument(
+        "--target-team-id",
+        default=None,
+        help="Optional Miro team id where the cloned board should be created.",
+    )
+    parser.add_argument(
         "--source-lang",
         default="DE",
         help='DeepL source language, e.g. "DE". Use empty string for auto-detect.',
@@ -518,6 +673,7 @@ def main() -> int:
         miro_token=miro_token,
         source_board_id=source_board_id,
         clone_name=clone_name,
+        target_team_id=args.target_team_id,
     )
 
     clone_board_id = clone.get("id")
@@ -533,6 +689,12 @@ def main() -> int:
     )
     if view_link:
         print(f"Clone link: {view_link}")
+
+    if not args.dry_run:
+        verify_miro_write_access(
+            miro_token=miro_token,
+            board_id=clone_board_id,
+        )
 
     if args.sleep_after_copy > 0:
         print(f"Waiting {args.sleep_after_copy}s for board copy to settle...")
