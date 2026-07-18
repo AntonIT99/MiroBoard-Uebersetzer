@@ -19,13 +19,17 @@ from dotenv import load_dotenv
 
 
 MIRO_API_BASE = "https://api.miro.com/v2"
-DEFAULT_CT2_MODEL_DIR = "models/opus-mt-de-en-ct2"
-DEFAULT_HF_TOKENIZER_MODEL = "Helsinki-NLP/opus-mt-de-en"
+DEFAULT_CT2_MODEL_DIR = "models/nllb-200-distilled-1.3B-ct2"
+DEFAULT_HF_TOKENIZER_MODEL = "facebook/nllb-200-distilled-1.3B"
+DEFAULT_CT2_MODEL_FAMILY = "nllb"
+DEFAULT_SOURCE_LANG_CODE = "deu_Latn"
+DEFAULT_TARGET_LANG_CODE = "eng_Latn"
 TRANSLATION_CACHE_FILE = Path("translation_cache_ct2_de_en.json")
 DEFAULT_GLOSSARY_FILE = "translation_glossary_de_en.json"
 CT2_CONVERSION_COMMAND = (
-    "ct2-transformers-converter --model Helsinki-NLP/opus-mt-de-en "
-    "--output_dir models/opus-mt-de-en-ct2 --quantization int8 --force"
+    "ct2-transformers-converter --model facebook/nllb-200-distilled-1.3B "
+    "--output_dir models/nllb-200-distilled-1.3B-ct2 "
+    "--quantization int8 --force"
 )
 PYTHON_DEPENDENCIES_COMMAND = (
     "pip install ctranslate2 torch transformers sentencepiece sacremoses beautifulsoup4 "
@@ -422,13 +426,26 @@ class Ct2TranslatorBackend:
     tokenizer: Any
     tokenizer_model: str
     ct2_model_dir: str
+    model_family: str
+    source_lang_code: str
+    target_lang_code: str
+    beam_size: int
     batch_size: int
+    preserve_special_symbols: bool
 
 
 def create_ct2_backend(args: argparse.Namespace) -> Ct2TranslatorBackend:
+    model_family = resolve_ct2_model_family(
+        args.ct2_model_family,
+        args.hf_tokenizer_model,
+        args.ct2_model_dir,
+    )
     translator, tokenizer = create_ct2_translator(
         ct2_model_dir=args.ct2_model_dir,
         tokenizer_model=args.hf_tokenizer_model,
+        model_family=model_family,
+        source_lang_code=args.source_lang_code,
+        target_lang_code=args.target_lang_code,
         device=args.ct2_device,
         compute_type=args.ct2_compute_type,
     )
@@ -437,7 +454,12 @@ def create_ct2_backend(args: argparse.Namespace) -> Ct2TranslatorBackend:
         tokenizer=tokenizer,
         tokenizer_model=args.hf_tokenizer_model,
         ct2_model_dir=args.ct2_model_dir,
+        model_family=model_family,
+        source_lang_code=args.source_lang_code,
+        target_lang_code=args.target_lang_code,
+        beam_size=args.beam_size,
         batch_size=args.translation_batch_size,
+        preserve_special_symbols=args.preserve_special_symbols,
     )
 
 
@@ -502,23 +524,45 @@ def save_translation_cache(cache: Dict[str, str]) -> None:
 
 def make_translation_cache_key(
     text: str,
-    tokenizer_model: str,
-    ct2_model_dir: str,
+    backend: Ct2TranslatorBackend,
 ) -> str:
     return json.dumps(
         {
+            "beam_size": backend.beam_size,
+            "ct2_model_dir": str(Path(backend.ct2_model_dir)),
+            "model_family": backend.model_family,
+            "preserve_special_symbols": backend.preserve_special_symbols,
+            "source_lang_code": backend.source_lang_code,
             "source_text": text,
-            "tokenizer_model": tokenizer_model,
-            "ct2_model_dir": str(Path(ct2_model_dir)),
+            "symbol_protection_version": 1,
+            "target_lang_code": backend.target_lang_code,
+            "tokenizer_model": backend.tokenizer_model,
         },
         ensure_ascii=False,
         sort_keys=True,
     )
 
 
+def resolve_ct2_model_family(
+    requested_family: str,
+    tokenizer_model: str,
+    ct2_model_dir: str,
+) -> str:
+    if requested_family != "auto":
+        return requested_family
+
+    model_hint = f"{tokenizer_model} {ct2_model_dir}".lower()
+    if "nllb" in model_hint:
+        return "nllb"
+    return "marian"
+
+
 def create_ct2_translator(
     ct2_model_dir: str,
     tokenizer_model: str,
+    model_family: str,
+    source_lang_code: str,
+    target_lang_code: str,
     device: str,
     compute_type: str,
 ) -> Tuple[Any, Any]:
@@ -550,7 +594,10 @@ def create_ct2_translator(
         ) from exc
 
     try:
-        tokenizer = AutoTokenizer.from_pretrained(tokenizer_model)
+        tokenizer_kwargs = {}
+        if model_family == "nllb":
+            tokenizer_kwargs["src_lang"] = source_lang_code
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_model, **tokenizer_kwargs)
     except (ImportError, ValueError) as exc:
         raise RuntimeError(
             "Could not load the Hugging Face tokenizer. Make sure sentencepiece "
@@ -563,6 +610,17 @@ def create_ct2_translator(
             "offline, download/cache the tokenizer first or use a local tokenizer "
             "directory."
         ) from exc
+
+    if model_family == "nllb":
+        known_language_codes = getattr(tokenizer, "lang_code_to_id", {})
+        for language_code, label in (
+            (source_lang_code, "--source-lang-code"),
+            (target_lang_code, "--target-lang-code"),
+        ):
+            if known_language_codes and language_code not in known_language_codes:
+                raise RuntimeError(
+                    f"Unknown NLLB language code for {label}: {language_code}"
+                )
 
     try:
         translator = ctranslate2.Translator(
@@ -617,23 +675,81 @@ def find_cuda_bin_dir() -> Optional[Path]:
     return None
 
 
-def translate_plain_batch_with_ct2(
+def is_protected_symbol_char(value: str) -> bool:
+    codepoint = ord(value)
+    return (
+        0x1F000 <= codepoint <= 0x1FAFF
+        or 0x2600 <= codepoint <= 0x27BF
+        or 0x2B00 <= codepoint <= 0x2BFF
+        or codepoint in (0x200D, 0x20E3, 0xFE0E, 0xFE0F)
+    )
+
+
+def split_text_by_protected_symbols(text: str) -> List[Tuple[bool, str]]:
+    segments: List[Tuple[bool, str]] = []
+    current: List[str] = []
+    current_protected: Optional[bool] = None
+    index = 0
+
+    def flush() -> None:
+        nonlocal current, current_protected
+        if current:
+            segments.append((bool(current_protected), "".join(current)))
+            current = []
+        current_protected = None
+
+    while index < len(text):
+        char = text[index]
+        if (
+            char in "0123456789#*"
+            and index + 1 < len(text)
+            and text[index + 1] in ("\ufe0f", "\u20e3")
+        ):
+            flush()
+            keycap_chars = [char]
+            index += 1
+            while index < len(text) and text[index] in ("\ufe0f", "\u20e3"):
+                keycap_chars.append(text[index])
+                index += 1
+            segments.append((True, "".join(keycap_chars)))
+            continue
+
+        protected = is_protected_symbol_char(char)
+        if current_protected is not None and protected != current_protected:
+            flush()
+        current_protected = protected
+        current.append(char)
+        index += 1
+
+    flush()
+    return segments
+
+
+def decode_ct2_tokens(tokenizer: Any, output_tokens: List[str]) -> str:
+    output_ids = tokenizer.convert_tokens_to_ids(output_tokens)
+    return tokenizer.decode(output_ids, skip_special_tokens=True).strip()
+
+
+def translate_plain_core_batch_with_ct2(
     texts: List[str],
-    translator: Any,
-    tokenizer: Any,
-    batch_size: int,
+    backend: Ct2TranslatorBackend,
 ) -> List[str]:
     translations: List[str] = []
 
-    for batch in chunk_list(texts, batch_size):
+    for batch in chunk_list(texts, backend.batch_size):
         source_batches = [
-            tokenizer.convert_ids_to_tokens(
-                tokenizer.encode(text, add_special_tokens=True)
+            backend.tokenizer.convert_ids_to_tokens(
+                backend.tokenizer.encode(text, add_special_tokens=True)
             )
             for text in batch
         ]
+        translate_kwargs: Dict[str, Any] = {"beam_size": backend.beam_size}
+        if backend.model_family == "nllb":
+            translate_kwargs["target_prefix"] = [
+                [backend.target_lang_code] for _ in source_batches
+            ]
         try:
-            results = translator.translate_batch(source_batches, beam_size=1)
+            results = backend.translator.translate_batch(source_batches, **translate_kwargs)
         except RuntimeError as exc:
             if is_cuda_runtime_load_error(exc):
                 raise RuntimeError(CUDA_DLL_HELP) from exc
@@ -647,10 +763,59 @@ def translate_plain_batch_with_ct2(
 
         for result in results:
             output_tokens = result.hypotheses[0]
-            output_ids = tokenizer.convert_tokens_to_ids(output_tokens)
-            translations.append(
-                tokenizer.decode(output_ids, skip_special_tokens=True).strip()
-            )
+            if backend.model_family == "nllb" and output_tokens:
+                output_tokens = output_tokens[1:]
+            translations.append(decode_ct2_tokens(backend.tokenizer, output_tokens))
+
+    return translations
+
+
+def translate_plain_batch_with_ct2(
+    texts: List[str],
+    backend: Ct2TranslatorBackend,
+) -> List[str]:
+    if not backend.preserve_special_symbols:
+        return translate_plain_core_batch_with_ct2(texts, backend)
+
+    prepared_texts: List[Tuple[Optional[str], List[Tuple[bool, str]]]] = []
+    cores_to_translate: List[str] = []
+
+    for text in texts:
+        segments = split_text_by_protected_symbols(text)
+        if not any(is_protected for is_protected, _ in segments):
+            prepared_texts.append((text, []))
+            cores_to_translate.append(text)
+            continue
+
+        prepared_texts.append((None, segments))
+        for is_protected, segment in segments:
+            if is_protected or not is_probably_translatable(segment):
+                continue
+
+            _, core_text, _ = split_surrounding_whitespace(segment)
+            if core_text:
+                cores_to_translate.append(core_text)
+
+    translated_cores = iter(translate_plain_core_batch_with_ct2(cores_to_translate, backend))
+    translations: List[str] = []
+    for original_text, segments in prepared_texts:
+        if original_text is not None:
+            translations.append(next(translated_cores))
+            continue
+
+        translated_parts: List[str] = []
+        for is_protected, segment in segments:
+            if is_protected or not is_probably_translatable(segment):
+                translated_parts.append(segment)
+                continue
+
+            prefix, core_text, suffix = split_surrounding_whitespace(segment)
+            if not core_text:
+                translated_parts.append(segment)
+                continue
+
+            translated_parts.append(prefix + next(translated_cores) + suffix)
+        translations.append("".join(translated_parts))
 
     return translations
 
@@ -663,9 +828,7 @@ def verify_ct2_backend_available(args: argparse.Namespace) -> Ct2TranslatorBacke
     backend = create_ct2_backend(args)
     translate_plain_batch_with_ct2(
         ["Hallo Welt"],
-        backend.translator,
-        backend.tokenizer,
-        batch_size=1,
+        backend,
     )
     print("Local translation backend is ready.")
     return backend
@@ -737,9 +900,18 @@ def translate_html_preserving_tags_with_ct2(
 
     translated_texts = translate_plain_batch_with_ct2(
         [replacement.source_text for replacement in replacements],
-        translator,
-        tokenizer,
-        batch_size,
+        Ct2TranslatorBackend(
+            translator=translator,
+            tokenizer=tokenizer,
+            tokenizer_model="<direct>",
+            ct2_model_dir="<direct>",
+            model_family="marian",
+            source_lang_code=DEFAULT_SOURCE_LANG_CODE,
+            target_lang_code=DEFAULT_TARGET_LANG_CODE,
+            beam_size=4,
+            batch_size=batch_size,
+            preserve_special_symbols=True,
+        ),
     )
 
     for replacement, translated_text in zip(replacements, translated_texts):
@@ -809,8 +981,7 @@ def get_cached_or_translate_texts(
 
         cache_key = make_translation_cache_key(
             text,
-            backend.tokenizer_model,
-            backend.ct2_model_dir,
+            backend,
         )
 
         if cache_key in cache:
@@ -834,16 +1005,13 @@ def get_cached_or_translate_texts(
     for batch in chunk_list(texts_to_translate, backend.batch_size):
         translated_batch = translate_plain_batch_with_ct2(
             batch,
-            backend.translator,
-            backend.tokenizer,
-            backend.batch_size,
+            backend,
         )
 
         for source_text, translated_text in zip(batch, translated_batch):
             cache_key = make_translation_cache_key(
                 source_text,
-                backend.tokenizer_model,
-                backend.ct2_model_dir,
+                backend,
             )
             cache[cache_key] = translated_text
             processed_text, replacement_count = apply_glossary_postprocessing(
@@ -2240,12 +2408,31 @@ def main() -> int:
         help=f"Converted CTranslate2 model directory. Default: {DEFAULT_CT2_MODEL_DIR}",
     )
     parser.add_argument(
+        "--ct2-model-family",
+        default=DEFAULT_CT2_MODEL_FAMILY,
+        choices=["auto", "marian", "nllb"],
+        help=(
+            "CTranslate2 model family. Use nllb for facebook/nllb models and "
+            "marian for Helsinki/OPUS-MT models. Default: nllb."
+        ),
+    )
+    parser.add_argument(
         "--hf-tokenizer-model",
         default=DEFAULT_HF_TOKENIZER_MODEL,
         help=(
             "Hugging Face tokenizer model name or local tokenizer directory. "
             f"Default: {DEFAULT_HF_TOKENIZER_MODEL}"
         ),
+    )
+    parser.add_argument(
+        "--source-lang-code",
+        default=DEFAULT_SOURCE_LANG_CODE,
+        help="Tokenizer source language code for multilingual models. Default: deu_Latn.",
+    )
+    parser.add_argument(
+        "--target-lang-code",
+        default=DEFAULT_TARGET_LANG_CODE,
+        help="Tokenizer target language code for multilingual models. Default: eng_Latn.",
     )
     parser.add_argument(
         "--ct2-device",
@@ -2265,6 +2452,21 @@ def main() -> int:
         type=int,
         default=32,
         help="Number of plain text units translated per CTranslate2 batch.",
+    )
+    parser.add_argument(
+        "--beam-size",
+        type=int,
+        default=4,
+        help="Beam search size for translation quality/speed tradeoff. Default: 4.",
+    )
+    parser.add_argument(
+        "--preserve-special-symbols",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Protect emojis, pictograms, dingbats, and similar symbols from the "
+            "translator and reinsert them unchanged. Default: true."
+        ),
     )
     parser.add_argument(
         "--glossary-file",
@@ -2301,6 +2503,10 @@ def main() -> int:
 
     if args.translation_batch_size < 1:
         print("--translation-batch-size must be at least 1", file=sys.stderr)
+        return 2
+
+    if args.beam_size < 1:
+        print("--beam-size must be at least 1", file=sys.stderr)
         return 2
 
     if args.update_existing_clone and not args.clone_board:

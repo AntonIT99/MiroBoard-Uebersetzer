@@ -1,6 +1,6 @@
 # Miro Board Übersetzer
 
-Dieses Tool erstellt einen englischen Klon eines bestehenden Miro-Boards oder aktualisiert einen bestehenden englischen Klon. Unterstützte Textelemente werden lokal mit CTranslate2 und dem Hugging-Face-Modell `Helsinki-NLP/opus-mt-de-en` übersetzt.
+Dieses Tool erstellt einen englischen Klon eines bestehenden Miro-Boards oder aktualisiert einen bestehenden englischen Klon. Unterstützte Textelemente werden lokal mit CTranslate2 und dem Hugging-Face-Modell `facebook/nllb-200-distilled-1.3B` übersetzt.
 
 ## Funktionsweise
 
@@ -67,18 +67,21 @@ benötigt. Die spätere Übersetzung läuft über CTranslate2.
 
 ## Lokales Übersetzungsmodell vorbereiten
 
-Das Script verwendet standardmäßig das Modell `Helsinki-NLP/opus-mt-de-en`, das einmalig heruntergeladen und nach CTranslate2 konvertiert werden muss:
+Das Script verwendet standardmäßig `facebook/nllb-200-distilled-1.3B`. Dieses
+NLLB-Modell ist größer und qualitativ stärker als das bisherige
+`Helsinki-NLP/opus-mt-de-en`, läuft aber nach der Konvertierung weiterhin lokal
+über CTranslate2.
 
 ```powershell
-ct2-transformers-converter --model Helsinki-NLP/opus-mt-de-en --output_dir models/opus-mt-de-en-ct2 --quantization int8 --force
+ct2-transformers-converter --model facebook/nllb-200-distilled-1.3B --output_dir models/nllb-200-distilled-1.3B-ct2 --quantization int8 --force
 ```
 
 Unter Windows kann der explizite Aufruf aus der virtuellen Umgebung robuster sein:
 
 ```powershell
 .\.venv\Scripts\ct2-transformers-converter.exe `
-  --model Helsinki-NLP/opus-mt-de-en `
-  --output_dir models/opus-mt-de-en-ct2 `
+  --model facebook/nllb-200-distilled-1.3B `
+  --output_dir models/nllb-200-distilled-1.3B-ct2 `
   --quantization int8 `
   --force
 ```
@@ -86,7 +89,7 @@ Unter Windows kann der explizite Aufruf aus der virtuellen Umgebung robuster sei
 Danach liegt das lokale CTranslate2-Modell in:
 
 ```text
-models/opus-mt-de-en-ct2
+models/nllb-200-distilled-1.3B-ct2
 ```
 
 Nach dem Download und der Konvertierung läuft die Übersetzung lokal/offline und verursacht keine DeepL- oder Cloud-Übersetzungskosten.
@@ -122,8 +125,15 @@ diesem Ziel-Team die nötigen Rechte haben. Ohne `--target-team-id` entscheidet
 Miro anhand des Token-/Account-Kontexts, in welchem Team der Klon landet.
 
 Übersetzungen werden in `translation_cache_ct2_de_en.json` zwischengespeichert.
-Der Cache-Key enthält den Ausgangstext, das Tokenizer-Modell und den lokalen
-CTranslate2-Modellpfad. Identische Texte werden dadurch nicht erneut übersetzt.
+Der Cache-Key enthält den Ausgangstext, das Tokenizer-Modell, den lokalen
+CTranslate2-Modellpfad, Sprachcodes, Beam-Size und Symbolschutz-Einstellung.
+Identische Texte werden dadurch nicht erneut übersetzt, aber neue Modell- oder
+Qualitätseinstellungen erzeugen sauber getrennte Cache-Einträge.
+
+Emojis, Piktogramme, Dingbats und ähnliche Symbole werden standardmäßig vor der
+Übersetzung geschützt und danach unverändert wieder eingesetzt. Das reduziert
+verlorene oder falsch interpretierte Icons in Miro-Texten. Bei Bedarf kann dieses
+Verhalten mit `--no-preserve-special-symbols` deaktiviert werden.
 
 ## Glossar
 
@@ -277,11 +287,15 @@ python main.py `
   --source-board "uXjVDEINBOARDID=" `
   --clone-name "[EN] Mein Workshop" `
   --translator "ct2" `
-  --ct2-model-dir "models/opus-mt-de-en-ct2" `
-  --hf-tokenizer-model "Helsinki-NLP/opus-mt-de-en" `
+  --ct2-model-dir "models/nllb-200-distilled-1.3B-ct2" `
+  --ct2-model-family "nllb" `
+  --hf-tokenizer-model "facebook/nllb-200-distilled-1.3B" `
+  --source-lang-code "deu_Latn" `
+  --target-lang-code "eng_Latn" `
   --ct2-device "cpu" `
   --ct2-compute-type "int8" `
-  --translation-batch-size 32
+  --translation-batch-size 32 `
+  --beam-size 4
 ```
 
 ### NVIDIA-GPU verwenden
@@ -296,8 +310,13 @@ python main.py `
   --target-team-id "DEIN_MIRO_TEAM_ID" `
   --ct2-device "cuda" `
   --ct2-compute-type "int8_float16" `
-  --translation-batch-size 64
+  --translation-batch-size 32 `
+  --beam-size 4
 ```
+
+Auf einer RTX 5070 Ti mit 16 GB VRAM ist `--ct2-device cuda` mit
+`--ct2-compute-type int8_float16` der empfohlene Startpunkt. Wenn Speicherfehler
+auftreten, zuerst `--translation-batch-size 16` testen.
 
 Wenn CUDA/CTranslate2 auf dem System noch nicht korrekt eingerichtet ist oder
 Speicherfehler auftreten, zuerst auf die CPU-Variante zurückgehen:
@@ -363,11 +382,16 @@ python main.py `
 | `--text-only-update` | implizit | Aktualisiert im Update-Modus nur übersetzte Textfelder; Alias für `--no-update-layout`. |
 | `--sync-supported-items-only` / `--no-sync-supported-items-only` | an | Synchronisiert nur unterstützte translatable Item-Typen. |
 | `--translator` | `ct2` | Übersetzungsbackend. Aktuell ist nur `ct2` unterstützt. |
-| `--ct2-model-dir` | `models/opus-mt-de-en-ct2` | Lokales konvertiertes CTranslate2-Modell. |
-| `--hf-tokenizer-model` | `Helsinki-NLP/opus-mt-de-en` | Hugging-Face-Tokenizer-Modell oder lokaler Tokenizer-Pfad. |
+| `--ct2-model-dir` | `models/nllb-200-distilled-1.3B-ct2` | Lokales konvertiertes CTranslate2-Modell. |
+| `--ct2-model-family` | `nllb` | Modellfamilie für Decoding-Regeln: `nllb`, `marian` oder `auto`. |
+| `--hf-tokenizer-model` | `facebook/nllb-200-distilled-1.3B` | Hugging-Face-Tokenizer-Modell oder lokaler Tokenizer-Pfad. |
+| `--source-lang-code` | `deu_Latn` | Source-Sprachcode für mehrsprachige Modelle wie NLLB. |
+| `--target-lang-code` | `eng_Latn` | Target-Sprachcode für mehrsprachige Modelle wie NLLB. |
 | `--ct2-device` | `cpu` | CTranslate2-Gerät, z. B. `cpu` oder `cuda`. |
 | `--ct2-compute-type` | `int8` | CTranslate2-Compute-Type, z. B. `int8`, `int8_float16`, `float32` oder `float16`. |
 | `--translation-batch-size` | `32` | Anzahl Plain-Text-Einheiten pro lokaler Übersetzungsbatch. |
+| `--beam-size` | `4` | Beam-Search-Größe; höhere Werte sind oft besser, aber langsamer. |
+| `--preserve-special-symbols` / `--no-preserve-special-symbols` | an | Schützt Emojis und ähnliche Symbole vor der Übersetzung und setzt sie unverändert wieder ein. |
 | `--glossary-file` | `translation_glossary_de_en.json` | JSON-Glossar für exakte Overrides und Post-Processing. |
 | `--disable-glossary` | aus | Deaktiviert das Glossar. |
 | `--sleep-after-copy` | `3.0` | Wartezeit nach dem Kopieren, bevor Items gelesen werden. |
