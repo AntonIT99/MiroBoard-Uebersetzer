@@ -67,13 +67,15 @@ benötigt. Die spätere Übersetzung läuft über CTranslate2.
 
 ## Lokales Übersetzungsmodell vorbereiten
 
-Das Script verwendet standardmäßig `facebook/nllb-200-distilled-1.3B`. Dieses
-NLLB-Modell ist größer und qualitativ stärker als das bisherige
-`Helsinki-NLP/opus-mt-de-en`, läuft aber nach der Konvertierung weiterhin lokal
-über CTranslate2.
+Das Script verwendet standardmäßig `facebook/nllb-200-distilled-1.3B` für die
+normale Übersetzung. Verdächtige Übersetzungen werden standardmäßig zusätzlich
+mit `facebook/nllb-200-3.3B` neu übersetzt. Das 3.3B-Modell wird nur selektiv
+genutzt, damit Qualität dort steigt, wo kurze Begriffe, wenig Kontext,
+Validierungsprobleme, Round-Trip-Abweichungen oder lange/komplexe Texte auffallen.
 
 ```powershell
-ct2-transformers-converter --model facebook/nllb-200-distilled-1.3B --output_dir models/nllb-200-distilled-1.3B-ct2 --quantization int8 --force
+ct2-transformers-converter --model facebook/nllb-200-distilled-1.3B --output_dir models/nllb-200-distilled-1.3B-ct2 --quantization float16 --force
+ct2-transformers-converter --model facebook/nllb-200-3.3B --output_dir models/nllb-200-3.3B-ct2 --quantization float16 --force
 ```
 
 Unter Windows kann der explizite Aufruf aus der virtuellen Umgebung robuster sein:
@@ -82,7 +84,13 @@ Unter Windows kann der explizite Aufruf aus der virtuellen Umgebung robuster sei
 .\.venv\Scripts\ct2-transformers-converter.exe `
   --model facebook/nllb-200-distilled-1.3B `
   --output_dir models/nllb-200-distilled-1.3B-ct2 `
-  --quantization int8 `
+  --quantization float16 `
+  --force
+
+.\.venv\Scripts\ct2-transformers-converter.exe `
+  --model facebook/nllb-200-3.3B `
+  --output_dir models/nllb-200-3.3B-ct2 `
+  --quantization float16 `
   --force
 ```
 
@@ -90,6 +98,7 @@ Danach liegt das lokale CTranslate2-Modell in:
 
 ```text
 models/nllb-200-distilled-1.3B-ct2
+models/nllb-200-3.3B-ct2
 ```
 
 Nach dem Download und der Konvertierung läuft die Übersetzung lokal/offline und verursacht keine DeepL- oder Cloud-Übersetzungskosten.
@@ -126,7 +135,8 @@ Miro anhand des Token-/Account-Kontexts, in welchem Team der Klon landet.
 
 Übersetzungen werden in `translation_cache_ct2_de_en.json` zwischengespeichert.
 Der Cache-Key enthält den Ausgangstext, das Tokenizer-Modell, den lokalen
-CTranslate2-Modellpfad, Sprachcodes, Beam-Size und Symbolschutz-Einstellung.
+CTranslate2-Modellpfad, Sprachcodes, Beam-Size, Tokenlimit und
+Symbolschutz-Einstellung.
 Identische Texte werden dadurch nicht erneut übersetzt, aber neue Modell- oder
 Qualitätseinstellungen erzeugen sauber getrennte Cache-Einträge.
 
@@ -134,6 +144,12 @@ Emojis, Piktogramme, Dingbats und ähnliche Symbole werden standardmäßig vor d
 Übersetzung geschützt und danach unverändert wieder eingesetzt. Das reduziert
 verlorene oder falsch interpretierte Icons in Miro-Texten. Bei Bedarf kann dieses
 Verhalten mit `--no-preserve-special-symbols` deaktiviert werden.
+
+Die sekundäre Qualitätsprüfung ist mit `--quality-review-mode suspicious`
+standardmäßig aktiv. Sie ersetzt verdächtige 1.3B-Übersetzungen durch 3.3B-Ausgaben.
+Mit `--quality-review-mode off` wird nur das schnelle 1.3B-Modell verwendet; mit
+`--quality-review-mode all` wird alles für finale Exporte durch das 3.3B-Modell
+übersetzt.
 
 ## Glossar
 
@@ -294,7 +310,7 @@ python main.py `
   --target-lang-code "eng_Latn" `
   --ct2-device "cpu" `
   --ct2-compute-type "int8" `
-  --translation-batch-size 32 `
+  --translation-batch-size 16 `
   --beam-size 4
 ```
 
@@ -309,14 +325,17 @@ python main.py `
   --clone-name "[EN] Mein Workshop" `
   --target-team-id "DEIN_MIRO_TEAM_ID" `
   --ct2-device "cuda" `
-  --ct2-compute-type "int8_float16" `
-  --translation-batch-size 32 `
-  --beam-size 4
+  --ct2-compute-type "float16" `
+  --translation-batch-size 16 `
+  --beam-size 4 `
+  --quality-review-mode "suspicious" `
+  --quality-review-batch-size 2 `
+  --quality-review-beam-size 4
 ```
 
 Auf einer RTX 5070 Ti mit 16 GB VRAM ist `--ct2-device cuda` mit
-`--ct2-compute-type int8_float16` der empfohlene Startpunkt. Wenn Speicherfehler
-auftreten, zuerst `--translation-batch-size 16` testen.
+`--ct2-compute-type float16` der empfohlene Startpunkt. Wenn Speicherfehler
+auftreten, zuerst `--quality-review-mode off` oder kleinere Batch-Sizes testen.
 
 Wenn CUDA/CTranslate2 auf dem System noch nicht korrekt eingerichtet ist oder
 Speicherfehler auftreten, zuerst auf die CPU-Variante zurückgehen:
@@ -328,7 +347,8 @@ python main.py `
   --target-team-id "DEIN_MIRO_TEAM_ID" `
   --ct2-device "cpu" `
   --ct2-compute-type "int8" `
-  --translation-batch-size 32
+  --translation-batch-size 16 `
+  --quality-review-mode off
 ```
 
 Wenn der Fehler `cublas64_12.dll is not found or cannot be loaded` erscheint,
@@ -350,6 +370,22 @@ PowerShell oder ein Neustart von PyCharm reicht oft aus. Das Script versucht
 zusätzlich, typische CUDA-12-Installationen wie
 `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9\bin` automatisch für
 die DLL-Suche zu registrieren.
+
+### Finale Qualitätsübersetzung
+
+Wenn Laufzeit weniger wichtig ist, kann das 3.3B-Modell für alle Textsegmente
+verwendet werden:
+
+```powershell
+python main.py `
+  --source-board "uXjVDEINBOARDID=" `
+  --clone-name "[EN FINAL] Mein Workshop" `
+  --ct2-device "cuda" `
+  --ct2-compute-type "float16" `
+  --quality-review-mode "all" `
+  --translation-batch-size 16 `
+  --quality-review-batch-size 2
+```
 
 ### Testlauf ohne finale Miro-Updates
 
@@ -388,10 +424,18 @@ python main.py `
 | `--source-lang-code` | `deu_Latn` | Source-Sprachcode für mehrsprachige Modelle wie NLLB. |
 | `--target-lang-code` | `eng_Latn` | Target-Sprachcode für mehrsprachige Modelle wie NLLB. |
 | `--ct2-device` | `cpu` | CTranslate2-Gerät, z. B. `cpu` oder `cuda`. |
-| `--ct2-compute-type` | `int8` | CTranslate2-Compute-Type, z. B. `int8`, `int8_float16`, `float32` oder `float16`. |
-| `--translation-batch-size` | `32` | Anzahl Plain-Text-Einheiten pro lokaler Übersetzungsbatch. |
+| `--ct2-compute-type` | automatisch | CTranslate2-Compute-Type; `float16` auf CUDA, `int8` auf CPU. |
+| `--translation-batch-size` | `16` | Anzahl Plain-Text-Einheiten pro lokalem 1.3B-Übersetzungsbatch. |
 | `--beam-size` | `4` | Beam-Search-Größe; höhere Werte sind oft besser, aber langsamer. |
+| `--max-input-tokens` | `512` | Maximale Input-Tokens pro Übersetzungs-Chunk für das 1.3B-Modell. |
 | `--preserve-special-symbols` / `--no-preserve-special-symbols` | an | Schützt Emojis und ähnliche Symbole vor der Übersetzung und setzt sie unverändert wieder ein. |
+| `--quality-review-mode` | `suspicious` | Sekundäre 3.3B-Prüfung: `off`, `suspicious` oder `all`. |
+| `--quality-review-ct2-model-dir` | `models/nllb-200-3.3B-ct2` | Lokales konvertiertes CTranslate2-Modell für Qualitätsprüfung. |
+| `--quality-review-hf-tokenizer-model` | `facebook/nllb-200-3.3B` | Tokenizer-Modell für die sekundäre Qualitätsprüfung. |
+| `--quality-review-batch-size` | `2` | Batch-Größe für das 3.3B-Modell. |
+| `--quality-review-beam-size` | `4` | Beam-Search-Größe für das 3.3B-Modell. |
+| `--quality-review-max-input-tokens` | `512` | Maximale Input-Tokens pro Übersetzungs-Chunk für das 3.3B-Modell. |
+| `--quality-review-round-trip` / `--no-quality-review-round-trip` | an | Nutzt DE→EN→DE-Abweichungen als Signal für 3.3B-Neuübersetzung. |
 | `--glossary-file` | `translation_glossary_de_en.json` | JSON-Glossar für exakte Overrides und Post-Processing. |
 | `--disable-glossary` | aus | Deaktiviert das Glossar. |
 | `--sleep-after-copy` | `3.0` | Wartezeit nach dem Kopieren, bevor Items gelesen werden. |

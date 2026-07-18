@@ -10,6 +10,7 @@ import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import datetime
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import quote, unquote, urlparse
@@ -24,12 +25,18 @@ DEFAULT_HF_TOKENIZER_MODEL = "facebook/nllb-200-distilled-1.3B"
 DEFAULT_CT2_MODEL_FAMILY = "nllb"
 DEFAULT_SOURCE_LANG_CODE = "deu_Latn"
 DEFAULT_TARGET_LANG_CODE = "eng_Latn"
+DEFAULT_QUALITY_REVIEW_CT2_MODEL_DIR = "models/nllb-200-3.3B-ct2"
+DEFAULT_QUALITY_REVIEW_HF_TOKENIZER_MODEL = "facebook/nllb-200-3.3B"
 TRANSLATION_CACHE_FILE = Path("translation_cache_ct2_de_en.json")
 DEFAULT_GLOSSARY_FILE = "translation_glossary_de_en.json"
 CT2_CONVERSION_COMMAND = (
     "ct2-transformers-converter --model facebook/nllb-200-distilled-1.3B "
     "--output_dir models/nllb-200-distilled-1.3B-ct2 "
-    "--quantization int8 --force"
+    "--quantization float16 --force"
+)
+QUALITY_REVIEW_CT2_CONVERSION_COMMAND = (
+    "ct2-transformers-converter --model facebook/nllb-200-3.3B "
+    "--output_dir models/nllb-200-3.3B-ct2 --quantization float16 --force"
 )
 PYTHON_DEPENDENCIES_COMMAND = (
     "pip install ctranslate2 torch transformers sentencepiece sacremoses beautifulsoup4 "
@@ -112,6 +119,14 @@ class SyncReport:
     newly_generated_translations: int = 0
     glossary_exact_overrides: int = 0
     glossary_post_replacements: int = 0
+    validation_rejected_translations: int = 0
+    round_trip_checks: int = 0
+    round_trip_disagreements: int = 0
+    quality_review_candidates: int = 0
+    quality_review_cached_translations_used: int = 0
+    quality_review_newly_generated_translations: int = 0
+    quality_review_retranslations: int = 0
+    quality_review_retranslations_rejected: int = 0
 
 
 class ApiError(RuntimeError):
@@ -431,6 +446,7 @@ class Ct2TranslatorBackend:
     target_lang_code: str
     beam_size: int
     batch_size: int
+    max_input_tokens: int
     preserve_special_symbols: bool
 
 
@@ -459,6 +475,39 @@ def create_ct2_backend(args: argparse.Namespace) -> Ct2TranslatorBackend:
         target_lang_code=args.target_lang_code,
         beam_size=args.beam_size,
         batch_size=args.translation_batch_size,
+        max_input_tokens=args.max_input_tokens,
+        preserve_special_symbols=args.preserve_special_symbols,
+    )
+
+
+def create_quality_review_ct2_backend(args: argparse.Namespace) -> Ct2TranslatorBackend:
+    review_device = args.quality_review_ct2_device or args.ct2_device
+    review_compute_type = args.quality_review_ct2_compute_type or args.ct2_compute_type
+    model_family = resolve_ct2_model_family(
+        args.quality_review_ct2_model_family,
+        args.quality_review_hf_tokenizer_model,
+        args.quality_review_ct2_model_dir,
+    )
+    translator, tokenizer = create_ct2_translator(
+        ct2_model_dir=args.quality_review_ct2_model_dir,
+        tokenizer_model=args.quality_review_hf_tokenizer_model,
+        model_family=model_family,
+        source_lang_code=args.source_lang_code,
+        target_lang_code=args.target_lang_code,
+        device=review_device,
+        compute_type=review_compute_type,
+    )
+    return Ct2TranslatorBackend(
+        translator=translator,
+        tokenizer=tokenizer,
+        tokenizer_model=args.quality_review_hf_tokenizer_model,
+        ct2_model_dir=args.quality_review_ct2_model_dir,
+        model_family=model_family,
+        source_lang_code=args.source_lang_code,
+        target_lang_code=args.target_lang_code,
+        beam_size=args.quality_review_beam_size,
+        batch_size=args.quality_review_batch_size,
+        max_input_tokens=args.quality_review_max_input_tokens,
         preserve_special_symbols=args.preserve_special_symbols,
     )
 
@@ -470,6 +519,14 @@ class TranslationStats:
     completed_fields: int = 0
     glossary_exact_overrides: int = 0
     glossary_post_replacements: int = 0
+    validation_rejected_translations: int = 0
+    round_trip_checks: int = 0
+    round_trip_disagreements: int = 0
+    quality_review_candidates: int = 0
+    quality_review_cached_translations_used: int = 0
+    quality_review_newly_generated_translations: int = 0
+    quality_review_retranslations: int = 0
+    quality_review_retranslations_rejected: int = 0
 
 
 @dataclass
@@ -530,6 +587,7 @@ def make_translation_cache_key(
         {
             "beam_size": backend.beam_size,
             "ct2_model_dir": str(Path(backend.ct2_model_dir)),
+            "max_input_tokens": backend.max_input_tokens,
             "model_family": backend.model_family,
             "preserve_special_symbols": backend.preserve_special_symbols,
             "source_lang_code": backend.source_lang_code,
@@ -612,7 +670,10 @@ def create_ct2_translator(
         ) from exc
 
     if model_family == "nllb":
-        known_language_codes = getattr(tokenizer, "lang_code_to_id", {})
+        known_language_codes = (
+            getattr(tokenizer, "lang_code_to_id", None)
+            or getattr(tokenizer, "added_tokens_encoder", {})
+        )
         for language_code, label in (
             (source_lang_code, "--source-lang-code"),
             (target_lang_code, "--target-lang-code"),
@@ -730,19 +791,79 @@ def decode_ct2_tokens(tokenizer: Any, output_tokens: List[str]) -> str:
     return tokenizer.decode(output_ids, skip_special_tokens=True).strip()
 
 
+def token_count_for_text(text: str, backend: Ct2TranslatorBackend) -> int:
+    return len(backend.tokenizer.encode(text, add_special_tokens=True))
+
+
+def split_text_by_token_limit(text: str, backend: Ct2TranslatorBackend) -> List[str]:
+    if backend.max_input_tokens < 1:
+        return [text]
+
+    if token_count_for_text(text, backend) <= backend.max_input_tokens:
+        return [text]
+
+    sentence_units = re.findall(r".+?(?:[.!?;:](?:\s+|$)|\n+|$)", text, flags=re.S)
+    if not sentence_units or "".join(sentence_units) != text:
+        sentence_units = re.findall(r"\S+\s*", text)
+
+    chunks: List[str] = []
+    current = ""
+
+    def append_current() -> None:
+        nonlocal current
+        if current:
+            chunks.append(current)
+            current = ""
+
+    for unit in sentence_units:
+        candidate = current + unit
+        if candidate and token_count_for_text(candidate, backend) <= backend.max_input_tokens:
+            current = candidate
+            continue
+
+        append_current()
+        if token_count_for_text(unit, backend) <= backend.max_input_tokens:
+            current = unit
+            continue
+
+        word_units = re.findall(r"\S+\s*", unit)
+        for word_unit in word_units:
+            candidate = current + word_unit
+            if candidate and token_count_for_text(candidate, backend) <= backend.max_input_tokens:
+                current = candidate
+            else:
+                append_current()
+                current = word_unit
+
+    append_current()
+    return chunks or [text]
+
+
+def encode_text_for_backend(text: str, backend: Ct2TranslatorBackend) -> List[str]:
+    if backend.model_family == "nllb" and hasattr(backend.tokenizer, "src_lang"):
+        backend.tokenizer.src_lang = backend.source_lang_code
+
+    return backend.tokenizer.convert_ids_to_tokens(
+        backend.tokenizer.encode(text, add_special_tokens=True)
+    )
+
+
 def translate_plain_core_batch_with_ct2(
     texts: List[str],
     backend: Ct2TranslatorBackend,
 ) -> List[str]:
-    translations: List[str] = []
+    translation_inputs: List[str] = []
+    chunk_counts: List[int] = []
 
-    for batch in chunk_list(texts, backend.batch_size):
-        source_batches = [
-            backend.tokenizer.convert_ids_to_tokens(
-                backend.tokenizer.encode(text, add_special_tokens=True)
-            )
-            for text in batch
-        ]
+    for text in texts:
+        chunks = split_text_by_token_limit(text, backend)
+        chunk_counts.append(len(chunks))
+        translation_inputs.extend(chunks)
+
+    chunk_translations: List[str] = []
+
+    for batch in chunk_list(translation_inputs, backend.batch_size):
+        source_batches = [encode_text_for_backend(text, backend) for text in batch]
         translate_kwargs: Dict[str, Any] = {"beam_size": backend.beam_size}
         if backend.model_family == "nllb":
             translate_kwargs["target_prefix"] = [
@@ -765,8 +886,13 @@ def translate_plain_core_batch_with_ct2(
             output_tokens = result.hypotheses[0]
             if backend.model_family == "nllb" and output_tokens:
                 output_tokens = output_tokens[1:]
-            translations.append(decode_ct2_tokens(backend.tokenizer, output_tokens))
+            chunk_translations.append(decode_ct2_tokens(backend.tokenizer, output_tokens))
 
+    translations: List[str] = []
+    chunk_index = 0
+    for count in chunk_counts:
+        translations.append(" ".join(chunk_translations[chunk_index : chunk_index + count]))
+        chunk_index += count
     return translations
 
 
@@ -818,6 +944,313 @@ def translate_plain_batch_with_ct2(
         translations.append("".join(translated_parts))
 
     return translations
+
+
+def normalized_text_for_similarity(text: str) -> str:
+    text = strip_html_for_empty_check(text).lower()
+    text = re.sub(r"[^\wäöüßà-öø-ÿ]+", " ", text, flags=re.IGNORECASE)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def text_similarity(left: str, right: str) -> float:
+    normalized_left = normalized_text_for_similarity(left)
+    normalized_right = normalized_text_for_similarity(right)
+    if not normalized_left and not normalized_right:
+        return 1.0
+    if not normalized_left or not normalized_right:
+        return 0.0
+    return SequenceMatcher(None, normalized_left, normalized_right).ratio()
+
+
+def word_count(text: str) -> int:
+    return len(re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿÄÖÜäöüß]+", strip_html_for_empty_check(text)))
+
+
+def has_german_signal(text: str) -> bool:
+    plain = normalized_text_for_similarity(text)
+    if re.search(r"[äöüß]", plain):
+        return True
+
+    german_markers = {
+        "aber",
+        "auch",
+        "auf",
+        "das",
+        "der",
+        "die",
+        "ein",
+        "eine",
+        "für",
+        "ist",
+        "mit",
+        "nicht",
+        "oder",
+        "und",
+        "werden",
+        "zu",
+    }
+    words = set(plain.split())
+    return bool(words & german_markers)
+
+
+def protected_symbol_sequence(text: str) -> List[str]:
+    return [
+        segment
+        for is_protected, segment in split_text_by_protected_symbols(text)
+        if is_protected
+    ]
+
+
+def validate_translation_candidate(source_text: str, translated_text: str) -> List[str]:
+    reasons: List[str] = []
+    source_plain = strip_html_for_empty_check(source_text)
+    translated_plain = strip_html_for_empty_check(translated_text)
+
+    if source_plain and not translated_plain:
+        reasons.append("empty_translation")
+
+    if source_plain and re.search(r"[A-Za-zÀ-ÖØ-öø-ÿÄÖÜäöüß]", source_plain):
+        if not re.search(r"[A-Za-zÀ-ÖØ-öø-ÿ]", translated_plain):
+            reasons.append("missing_translated_words")
+
+    if protected_symbol_sequence(source_text) != protected_symbol_sequence(translated_text):
+        reasons.append("protected_symbol_mismatch")
+
+    if "?" not in source_text and "?" in translated_text:
+        reasons.append("added_question")
+
+    if not source_plain.lstrip().startswith(("-", "–", "—")) and translated_plain.lstrip().startswith(
+        ("-", "–", "—")
+    ):
+        reasons.append("added_dialogue_marker")
+
+    if has_german_signal(source_text) and text_similarity(source_text, translated_text) > 0.92:
+        reasons.append("likely_untranslated")
+
+    if len(source_plain) >= 20 and translated_plain:
+        length_ratio = len(translated_plain) / max(len(source_plain), 1)
+        if length_ratio < 0.35:
+            reasons.append("translation_too_short")
+        elif length_ratio > 2.8:
+            reasons.append("translation_too_long")
+
+    return reasons
+
+
+def should_accept_review_translation(
+    source_text: str,
+    primary_translation: str,
+    review_translation: str,
+) -> bool:
+    if validate_translation_candidate(source_text, review_translation):
+        return False
+
+    source_words = word_count(source_text)
+    if source_words <= 3:
+        primary_words = word_count(primary_translation)
+        review_words = word_count(review_translation)
+        if review_words >= max(primary_words + 1, source_words * 2 + 1):
+            return False
+
+    return True
+
+
+def is_complex_text(text: str, args: argparse.Namespace) -> bool:
+    plain = strip_html_for_empty_check(text)
+    punctuation_count = len(re.findall(r"[,;:()\[\]{}]", plain))
+    sentence_count = len(re.findall(r"[.!?]+(?:\s+|$)", plain))
+    return (
+        len(plain) >= args.quality_review_long_text_chars
+        or word_count(plain) >= args.quality_review_long_text_words
+        or punctuation_count >= args.quality_review_complex_punctuation
+        or sentence_count >= args.quality_review_complex_sentences
+    )
+
+
+def is_low_resource_review_pair(source_lang_code: str, target_lang_code: str) -> bool:
+    high_resource_pairs = {
+        ("deu_Latn", "eng_Latn"),
+        ("eng_Latn", "deu_Latn"),
+    }
+    return (source_lang_code, target_lang_code) not in high_resource_pairs
+
+
+def make_backend_for_language_pair(
+    backend: Ct2TranslatorBackend,
+    source_lang_code: str,
+    target_lang_code: str,
+    *,
+    batch_size: Optional[int] = None,
+) -> Ct2TranslatorBackend:
+    return Ct2TranslatorBackend(
+        translator=backend.translator,
+        tokenizer=backend.tokenizer,
+        tokenizer_model=backend.tokenizer_model,
+        ct2_model_dir=backend.ct2_model_dir,
+        model_family=backend.model_family,
+        source_lang_code=source_lang_code,
+        target_lang_code=target_lang_code,
+        beam_size=backend.beam_size,
+        batch_size=batch_size or backend.batch_size,
+        max_input_tokens=backend.max_input_tokens,
+        preserve_special_symbols=backend.preserve_special_symbols,
+    )
+
+
+def get_backend_translations_with_cache(
+    texts: List[str],
+    backend: Ct2TranslatorBackend,
+    cache: Dict[str, str],
+    stats: TranslationStats,
+    *,
+    cached_stat: Optional[str],
+    generated_stat: Optional[str],
+) -> Dict[str, str]:
+    translated_by_text: Dict[str, str] = {}
+    texts_to_translate: List[str] = []
+    seen_missing: set[str] = set()
+
+    for text in texts:
+        cache_key = make_translation_cache_key(text, backend)
+        if cache_key in cache:
+            translated_by_text[text] = cache[cache_key]
+            if cached_stat:
+                setattr(stats, cached_stat, getattr(stats, cached_stat) + 1)
+            continue
+
+        if text not in seen_missing:
+            texts_to_translate.append(text)
+            seen_missing.add(text)
+
+    for batch in chunk_list(texts_to_translate, backend.batch_size):
+        translated_batch = translate_plain_batch_with_ct2(batch, backend)
+        for source_text, translated_text in zip(batch, translated_batch):
+            cache_key = make_translation_cache_key(source_text, backend)
+            cache[cache_key] = translated_text
+            translated_by_text[source_text] = translated_text
+
+        if generated_stat:
+            setattr(stats, generated_stat, getattr(stats, generated_stat) + len(batch))
+
+    return translated_by_text
+
+
+def quality_review_retranslations(
+    texts: List[str],
+    translated_by_text: Dict[str, str],
+    primary_backend: Ct2TranslatorBackend,
+    review_backend: Optional[Ct2TranslatorBackend],
+    cache: Dict[str, str],
+    stats: TranslationStats,
+    glossary: Glossary,
+    args: argparse.Namespace,
+) -> Dict[str, str]:
+    if args.quality_review_mode == "off" or not texts:
+        return translated_by_text
+
+    candidate_reasons: Dict[str, List[str]] = {}
+
+    for source_text in texts:
+        translated_text = translated_by_text.get(source_text, "")
+        reasons = validate_translation_candidate(source_text, translated_text)
+        if reasons:
+            stats.validation_rejected_translations += 1
+
+        source_word_count = word_count(source_text)
+        if source_word_count <= args.quality_review_short_text_words:
+            reasons.append("short_expression")
+        if is_complex_text(source_text, args):
+            reasons.append("long_or_complex_text")
+        if is_low_resource_review_pair(
+            primary_backend.source_lang_code,
+            primary_backend.target_lang_code,
+        ):
+            reasons.append("low_resource_language_pair")
+
+        if args.quality_review_mode == "all":
+            reasons.append("review_all")
+
+        if reasons:
+            candidate_reasons[source_text] = sorted(set(reasons))
+
+    if args.quality_review_round_trip:
+        roundtrip_sources = [
+            text
+            for text in texts
+            if text in translated_by_text and is_probably_translatable(translated_by_text[text])
+        ]
+        if roundtrip_sources:
+            roundtrip_backend = make_backend_for_language_pair(
+                primary_backend,
+                primary_backend.target_lang_code,
+                primary_backend.source_lang_code,
+                batch_size=args.translation_batch_size,
+            )
+            translated_values = [translated_by_text[text] for text in roundtrip_sources]
+            roundtrip_by_translation = get_backend_translations_with_cache(
+                translated_values,
+                roundtrip_backend,
+                cache,
+                stats,
+                cached_stat=None,
+                generated_stat=None,
+            )
+            stats.round_trip_checks += len(roundtrip_sources)
+            for source_text in roundtrip_sources:
+                roundtrip_text = roundtrip_by_translation.get(translated_by_text[source_text], "")
+                if (
+                    text_similarity(source_text, roundtrip_text)
+                    < args.quality_review_round_trip_threshold
+                ):
+                    stats.round_trip_disagreements += 1
+                    candidate_reasons.setdefault(source_text, []).append(
+                        "round_trip_disagreement"
+                    )
+
+    if not candidate_reasons:
+        return translated_by_text
+
+    if review_backend is None:
+        print(
+            "Loading secondary quality-review backend "
+            f"({args.quality_review_ct2_model_dir})..."
+        )
+        review_backend = create_quality_review_ct2_backend(args)
+
+    print(
+        "Quality review with secondary model: "
+        f"{len(candidate_reasons)} suspicious translations."
+    )
+    stats.quality_review_candidates += len(candidate_reasons)
+    reviewed_by_text = get_backend_translations_with_cache(
+        list(candidate_reasons),
+        review_backend,
+        cache,
+        stats,
+        cached_stat="quality_review_cached_translations_used",
+        generated_stat="quality_review_newly_generated_translations",
+    )
+
+    reviewed_translated_by_text = dict(translated_by_text)
+    for source_text, reviewed_translation in reviewed_by_text.items():
+        primary_translation = translated_by_text.get(source_text, "")
+        if not should_accept_review_translation(
+            source_text,
+            primary_translation,
+            reviewed_translation,
+        ):
+            stats.quality_review_retranslations_rejected += 1
+            continue
+
+        processed_text, replacement_count = apply_glossary_postprocessing(
+            reviewed_translation,
+            glossary,
+        )
+        reviewed_translated_by_text[source_text] = processed_text
+        stats.glossary_post_replacements += replacement_count
+        stats.quality_review_retranslations += 1
+
+    return reviewed_translated_by_text
 
 
 def verify_ct2_backend_available(args: argparse.Namespace) -> Ct2TranslatorBackend:
@@ -910,6 +1343,7 @@ def translate_html_preserving_tags_with_ct2(
             target_lang_code=DEFAULT_TARGET_LANG_CODE,
             beam_size=4,
             batch_size=batch_size,
+            max_input_tokens=512,
             preserve_special_symbols=True,
         ),
     )
@@ -967,9 +1401,11 @@ def get_cached_or_translate_texts(
     cache: Dict[str, str],
     stats: TranslationStats,
     glossary: Glossary,
+    args: argparse.Namespace,
 ) -> Dict[str, str]:
     translated_by_text: Dict[str, str] = {}
     texts_to_translate: List[str] = []
+    reviewable_texts: List[str] = []
     seen_missing: set[str] = set()
 
     for text in texts:
@@ -979,6 +1415,7 @@ def get_cached_or_translate_texts(
             stats.glossary_exact_overrides += 1
             continue
 
+        reviewable_texts.append(text)
         cache_key = make_translation_cache_key(
             text,
             backend,
@@ -997,9 +1434,6 @@ def get_cached_or_translate_texts(
         if text not in seen_missing:
             texts_to_translate.append(text)
             seen_missing.add(text)
-
-    if not texts_to_translate:
-        return translated_by_text
 
     generated_since_save = 0
     for batch in chunk_list(texts_to_translate, backend.batch_size):
@@ -1027,6 +1461,18 @@ def get_cached_or_translate_texts(
         if generated_since_save >= TRANSLATION_CACHE_SAVE_INTERVAL:
             save_translation_cache(cache)
             generated_since_save = 0
+
+    if args.quality_review_mode != "off" and reviewable_texts:
+        translated_by_text = quality_review_retranslations(
+            texts=reviewable_texts,
+            translated_by_text=translated_by_text,
+            primary_backend=backend,
+            review_backend=None,
+            cache=cache,
+            stats=stats,
+            glossary=glossary,
+            args=args,
+        )
 
     return translated_by_text
 
@@ -1070,6 +1516,7 @@ def translate_targets_with_ct2(
         cache=cache,
         stats=stats,
         glossary=glossary,
+        args=args,
     )
 
     result: Dict[Tuple[str, str, str], str] = {}
@@ -1104,6 +1551,23 @@ def translate_targets_with_ct2(
     print(f"Newly generated translations: {stats.newly_generated_translations}")
     print(f"Glossary exact overrides: {stats.glossary_exact_overrides}")
     print(f"Glossary post-processing replacements: {stats.glossary_post_replacements}")
+    print(f"Validation-rejected translations: {stats.validation_rejected_translations}")
+    print(f"Round-trip checks: {stats.round_trip_checks}")
+    print(f"Round-trip disagreements: {stats.round_trip_disagreements}")
+    print(f"Quality-review candidates: {stats.quality_review_candidates}")
+    print(
+        "Quality-review cached translations used: "
+        f"{stats.quality_review_cached_translations_used}"
+    )
+    print(
+        "Quality-review newly generated translations: "
+        f"{stats.quality_review_newly_generated_translations}"
+    )
+    print(f"Quality-review retranslations applied: {stats.quality_review_retranslations}")
+    print(
+        "Quality-review retranslations rejected: "
+        f"{stats.quality_review_retranslations_rejected}"
+    )
 
     return result, stats
 
@@ -1905,6 +2369,23 @@ def print_run_summary(report: SyncReport) -> None:
     print(f"Newly generated translations: {report.newly_generated_translations}")
     print(f"Glossary exact overrides: {report.glossary_exact_overrides}")
     print(f"Glossary post-processing replacements: {report.glossary_post_replacements}")
+    print(f"Validation-rejected translations: {report.validation_rejected_translations}")
+    print(f"Round-trip checks: {report.round_trip_checks}")
+    print(f"Round-trip disagreements: {report.round_trip_disagreements}")
+    print(f"Quality-review candidates: {report.quality_review_candidates}")
+    print(
+        "Quality-review cached translations used: "
+        f"{report.quality_review_cached_translations_used}"
+    )
+    print(
+        "Quality-review newly generated translations: "
+        f"{report.quality_review_newly_generated_translations}"
+    )
+    print(f"Quality-review retranslations applied: {report.quality_review_retranslations}")
+    print(
+        "Quality-review retranslations rejected: "
+        f"{report.quality_review_retranslations_rejected}"
+    )
     if report.sync_state_file:
         print(f"Sync-state file: {report.sync_state_file}")
 
@@ -1917,6 +2398,20 @@ def update_report_from_translation_stats(
     report.newly_generated_translations = stats.newly_generated_translations
     report.glossary_exact_overrides = stats.glossary_exact_overrides
     report.glossary_post_replacements = stats.glossary_post_replacements
+    report.validation_rejected_translations = stats.validation_rejected_translations
+    report.round_trip_checks = stats.round_trip_checks
+    report.round_trip_disagreements = stats.round_trip_disagreements
+    report.quality_review_candidates = stats.quality_review_candidates
+    report.quality_review_cached_translations_used = (
+        stats.quality_review_cached_translations_used
+    )
+    report.quality_review_newly_generated_translations = (
+        stats.quality_review_newly_generated_translations
+    )
+    report.quality_review_retranslations = stats.quality_review_retranslations
+    report.quality_review_retranslations_rejected = (
+        stats.quality_review_retranslations_rejected
+    )
 
 
 def run_rebuild_mode(
@@ -2441,23 +2936,29 @@ def main() -> int:
     )
     parser.add_argument(
         "--ct2-compute-type",
-        default="int8",
+        default=None,
         help=(
             'CTranslate2 compute type, e.g. "int8", "int8_float16", '
-            '"float32", or "float16".'
+            '"float32", or "float16". Default: float16 on CUDA, int8 on CPU.'
         ),
     )
     parser.add_argument(
         "--translation-batch-size",
         type=int,
-        default=32,
-        help="Number of plain text units translated per CTranslate2 batch.",
+        default=16,
+        help="Number of plain text units translated per CTranslate2 batch. Default: 16.",
     )
     parser.add_argument(
         "--beam-size",
         type=int,
         default=4,
         help="Beam search size for translation quality/speed tradeoff. Default: 4.",
+    )
+    parser.add_argument(
+        "--max-input-tokens",
+        type=int,
+        default=512,
+        help="Maximum input tokens per translation chunk. Default: 512.",
     )
     parser.add_argument(
         "--preserve-special-symbols",
@@ -2467,6 +2968,107 @@ def main() -> int:
             "Protect emojis, pictograms, dingbats, and similar symbols from the "
             "translator and reinsert them unchanged. Default: true."
         ),
+    )
+    parser.add_argument(
+        "--quality-review-mode",
+        default="suspicious",
+        choices=["off", "suspicious", "all"],
+        help=(
+            "Use the secondary quality model to replace suspicious translations, "
+            "all translations, or none. Default: suspicious."
+        ),
+    )
+    parser.add_argument(
+        "--quality-review-ct2-model-dir",
+        default=DEFAULT_QUALITY_REVIEW_CT2_MODEL_DIR,
+        help=(
+            "Converted CTranslate2 directory for the secondary quality model. "
+            f"Default: {DEFAULT_QUALITY_REVIEW_CT2_MODEL_DIR}"
+        ),
+    )
+    parser.add_argument(
+        "--quality-review-hf-tokenizer-model",
+        default=DEFAULT_QUALITY_REVIEW_HF_TOKENIZER_MODEL,
+        help=(
+            "Hugging Face tokenizer model for the secondary quality model. "
+            f"Default: {DEFAULT_QUALITY_REVIEW_HF_TOKENIZER_MODEL}"
+        ),
+    )
+    parser.add_argument(
+        "--quality-review-ct2-model-family",
+        default="nllb",
+        choices=["auto", "marian", "nllb"],
+        help="Secondary quality model family. Default: nllb.",
+    )
+    parser.add_argument(
+        "--quality-review-ct2-device",
+        default=None,
+        help="Secondary quality model device. Default: inherit --ct2-device.",
+    )
+    parser.add_argument(
+        "--quality-review-ct2-compute-type",
+        default=None,
+        help="Secondary quality model compute type. Default: inherit --ct2-compute-type.",
+    )
+    parser.add_argument(
+        "--quality-review-batch-size",
+        type=int,
+        default=2,
+        help="Secondary quality model batch size. Default: 2.",
+    )
+    parser.add_argument(
+        "--quality-review-beam-size",
+        type=int,
+        default=4,
+        help="Secondary quality model beam size. Default: 4.",
+    )
+    parser.add_argument(
+        "--quality-review-max-input-tokens",
+        type=int,
+        default=512,
+        help="Secondary quality model maximum input tokens per chunk. Default: 512.",
+    )
+    parser.add_argument(
+        "--quality-review-round-trip",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use NLLB round-trip disagreement as a quality-review signal. Default: true.",
+    )
+    parser.add_argument(
+        "--quality-review-round-trip-threshold",
+        type=float,
+        default=0.55,
+        help="Minimum source vs round-trip similarity before review. Default: 0.55.",
+    )
+    parser.add_argument(
+        "--quality-review-short-text-words",
+        type=int,
+        default=3,
+        help="Review texts with this many words or fewer. Default: 3.",
+    )
+    parser.add_argument(
+        "--quality-review-long-text-chars",
+        type=int,
+        default=240,
+        help="Review texts at or above this character count. Default: 240.",
+    )
+    parser.add_argument(
+        "--quality-review-long-text-words",
+        type=int,
+        default=35,
+        help="Review texts at or above this word count. Default: 35.",
+    )
+    parser.add_argument(
+        "--quality-review-complex-punctuation",
+        type=int,
+        default=3,
+        help="Review texts with this many complex punctuation marks. Default: 3.",
+    )
+    parser.add_argument(
+        "--quality-review-complex-sentences",
+        type=int,
+        default=2,
+        help="Review texts with this many sentences or more. Default: 2.",
     )
     parser.add_argument(
         "--glossary-file",
@@ -2495,6 +3097,15 @@ def main() -> int:
 
     args = parser.parse_args()
 
+    if args.ct2_compute_type is None:
+        args.ct2_compute_type = (
+            "float16" if args.ct2_device.lower() == "cuda" else "int8"
+        )
+    if args.quality_review_ct2_device is None:
+        args.quality_review_ct2_device = args.ct2_device
+    if args.quality_review_ct2_compute_type is None:
+        args.quality_review_ct2_compute_type = args.ct2_compute_type
+
     miro_token = os.getenv("MIRO_ACCESS_TOKEN")
 
     if not miro_token:
@@ -2507,6 +3118,44 @@ def main() -> int:
 
     if args.beam_size < 1:
         print("--beam-size must be at least 1", file=sys.stderr)
+        return 2
+
+    if args.max_input_tokens < 1:
+        print("--max-input-tokens must be at least 1", file=sys.stderr)
+        return 2
+
+    if args.quality_review_batch_size < 1:
+        print("--quality-review-batch-size must be at least 1", file=sys.stderr)
+        return 2
+
+    if args.quality_review_beam_size < 1:
+        print("--quality-review-beam-size must be at least 1", file=sys.stderr)
+        return 2
+
+    if args.quality_review_max_input_tokens < 1:
+        print("--quality-review-max-input-tokens must be at least 1", file=sys.stderr)
+        return 2
+
+    if not 0 <= args.quality_review_round_trip_threshold <= 1:
+        print(
+            "--quality-review-round-trip-threshold must be between 0 and 1",
+            file=sys.stderr,
+        )
+        return 2
+
+    if (
+        args.quality_review_mode != "off"
+        and not args.initialize_sync_state
+        and not Path(args.quality_review_ct2_model_dir).is_dir()
+    ):
+        print(
+            "Missing converted secondary quality-review model directory: "
+            f"{args.quality_review_ct2_model_dir}\n"
+            "Create it with:\n"
+            f"  {QUALITY_REVIEW_CT2_CONVERSION_COMMAND}\n"
+            "Or disable secondary review with --quality-review-mode off.",
+            file=sys.stderr,
+        )
         return 2
 
     if args.update_existing_clone and not args.clone_board:
