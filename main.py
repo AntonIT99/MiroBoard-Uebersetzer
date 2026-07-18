@@ -1437,11 +1437,44 @@ def initialize_sync_state_from_existing_clone(
     return state, unmatched_source, unmatched_clone, ambiguous
 
 
+def writable_position_from_source(position: Any) -> Dict[str, Any]:
+    if not isinstance(position, dict):
+        return {}
+
+    return {
+        key: position[key]
+        for key in ("x", "y", "origin")
+        if key in position and position[key] is not None
+    }
+
+
+def writable_geometry_from_source(
+    item_type: Optional[str],
+    geometry: Any,
+) -> Dict[str, Any]:
+    if not isinstance(geometry, dict):
+        return {}
+
+    result = {
+        key: geometry[key]
+        for key in ("width", "height", "rotation")
+        if key in geometry and geometry[key] is not None
+    }
+
+    if item_type == "sticky_note" and "width" in result and "height" in result:
+        result.pop("height")
+    elif item_type == "text":
+        result.pop("height", None)
+
+    return result
+
+
 def build_item_payload_from_source(
     source_item: Dict[str, Any],
     translated_fields: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     payload: Dict[str, Any] = {}
+    item_type = source_item.get("type")
     data = dict(source_item.get("data") or {})
     for field, value in (translated_fields or {}).items():
         data[field] = value
@@ -1449,10 +1482,17 @@ def build_item_payload_from_source(
     if data:
         payload["data"] = data
 
-    for top_level_key in ("position", "geometry", "style"):
-        value = source_item.get(top_level_key)
-        if isinstance(value, dict) and value:
-            payload[top_level_key] = value
+    position = writable_position_from_source(source_item.get("position"))
+    if position:
+        payload["position"] = position
+
+    geometry = writable_geometry_from_source(item_type, source_item.get("geometry"))
+    if geometry:
+        payload["geometry"] = geometry
+
+    style = source_item.get("style")
+    if isinstance(style, dict) and style:
+        payload["style"] = style
 
     return payload
 
@@ -1570,11 +1610,12 @@ def update_clone_item_from_source_item(
             )
 
     if not translated_fields:
-        print(
-            f"WARNING: No translated fields available for {item_type} {clone_item_id}; "
-            "skipping text-only fallback.",
-            file=sys.stderr,
-        )
+        if update_layout:
+            print(
+                f"WARNING: No translated fields available for {item_type} {clone_item_id}; "
+                "skipping text-only fallback.",
+                file=sys.stderr,
+            )
         return False
 
     patch_miro_item(
@@ -1934,6 +1975,10 @@ def run_update_existing_clone_mode(
 
     print(f"Source board: {source_board_id}")
     print(f"Existing clone board: {clone_board_id}")
+    if args.update_layout:
+        print("Update mode: text content and layout.")
+    else:
+        print("Update mode: text content only. Use --update-layout to sync layout.")
 
     print("Reading items from source board...")
     source_items = get_all_items(miro_token=miro_token, board_id=source_board_id)
@@ -2149,8 +2194,17 @@ def main() -> int:
     parser.add_argument(
         "--update-layout",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Update position/geometry/style in update mode when supported.",
+        default=False,
+        help=(
+            "Also update position/geometry/style in update mode when supported. "
+            "Default: false."
+        ),
+    )
+    parser.add_argument(
+        "--text-only-update",
+        dest="update_layout",
+        action="store_false",
+        help="Update only translated text in update mode. Alias for --no-update-layout.",
     )
     parser.add_argument(
         "--sync-supported-items-only",

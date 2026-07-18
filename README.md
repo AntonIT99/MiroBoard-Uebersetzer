@@ -199,6 +199,10 @@ python main.py `
   --target-lang EN-US
 ```
 
+Der Update-Modus aktualisiert standardmäßig nur die übersetzten Textinhalte.
+Das ist schneller und vermeidet unnötige Layout-Patches, wenn sich Positionen,
+Größen oder Styles seit dem letzten Lauf nicht geändert haben.
+
 Der Update-Modus benötigt eine Sync-State-Datei. Diese wird im Rebuild-Modus
 automatisch erzeugt. Wenn `--sync-state-file` nicht gesetzt ist, verwendet das
 Script einen deterministischen Dateinamen wie:
@@ -239,6 +243,23 @@ python main.py `
 
 Ohne `--delete-missing-items` werden fehlende Quell-Items nur gemeldet, aber
 nicht aus dem englischen Klon gelöscht.
+
+### Update-Modus mit Layout-Synchronisierung
+
+Wenn auch Positionen, Größen oder Styles vom Quell-Board übernommen werden
+sollen:
+
+```powershell
+python main.py `
+  --update-existing-clone `
+  --source-board "uXjVDEINBOARDID=" `
+  --clone-board "uXjVEXISTINGCLONEID=" `
+  --update-layout `
+  --target-lang EN-US
+```
+
+Für explizite Text-only-Läufe kann alternativ `--text-only-update` oder
+`--no-update-layout` gesetzt werden.
 
 ### Klon in einem bestimmten Miro-Team erstellen
 
@@ -338,7 +359,8 @@ python main.py `
 | `--initialize-sync-state` | aus | Erstellt eine Sync-State-Datei für einen bereits bestehenden übersetzten Klon und beendet den Lauf. |
 | `--force-initialize-sync-state` | aus | Erlaubt Initialisierung auch bei niedriger Mapping-Qualität. |
 | `--delete-missing-items` | aus | Löscht im Update-Modus Clone-Items, deren Source-Items nicht mehr existieren. |
-| `--update-layout` / `--no-update-layout` | an | Aktualisiert Position, Geometrie und Style im Update-Modus, soweit die Miro API es akzeptiert. |
+| `--update-layout` / `--no-update-layout` | aus | Aktualisiert Position, Geometrie und Style im Update-Modus, soweit die Miro API es akzeptiert. |
+| `--text-only-update` | implizit | Aktualisiert im Update-Modus nur übersetzte Textfelder; Alias für `--no-update-layout`. |
 | `--sync-supported-items-only` / `--no-sync-supported-items-only` | an | Synchronisiert nur unterstützte translatable Item-Typen. |
 | `--translator` | `ct2` | Übersetzungsbackend. Aktuell ist nur `ct2` unterstützt. |
 | `--ct2-model-dir` | `models/opus-mt-de-en-ct2` | Lokales konvertiertes CTranslate2-Modell. |
