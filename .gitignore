@@ -50,3 +50,7 @@ models/
 miro_sync_state_*.json
 *.tmp
 *.bak
+
+miro-board-exporter/.chrome-miro-profile/
+miro-board-exporter/.venv/
+miro-board-exporter/miro-export/

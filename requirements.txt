@@ -1,8 +1,0 @@
-ctranslate2
-torch
-transformers
-sentencepiece
-sacremoses
-beautifulsoup4
-requests
-python-dotenv
