@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-
 import argparse
 import hashlib
 import json
@@ -116,6 +114,7 @@ class SyncReport:
     ambiguous_items: int = 0
     updated_miro_items: int = 0
     cached_translations_used: int = 0
+    higher_quality_cached_translations_used: int = 0
     newly_generated_translations: int = 0
     glossary_exact_overrides: int = 0
     glossary_post_replacements: int = 0
@@ -124,6 +123,7 @@ class SyncReport:
     round_trip_disagreements: int = 0
     quality_review_candidates: int = 0
     quality_review_cached_translations_used: int = 0
+    quality_review_higher_quality_cached_translations_used: int = 0
     quality_review_newly_generated_translations: int = 0
     quality_review_retranslations: int = 0
     quality_review_retranslations_rejected: int = 0
@@ -515,6 +515,7 @@ def create_quality_review_ct2_backend(args: argparse.Namespace) -> Ct2Translator
 @dataclass
 class TranslationStats:
     cached_translations_used: int = 0
+    higher_quality_cached_translations_used: int = 0
     newly_generated_translations: int = 0
     completed_fields: int = 0
     glossary_exact_overrides: int = 0
@@ -524,6 +525,7 @@ class TranslationStats:
     round_trip_disagreements: int = 0
     quality_review_candidates: int = 0
     quality_review_cached_translations_used: int = 0
+    quality_review_higher_quality_cached_translations_used: int = 0
     quality_review_newly_generated_translations: int = 0
     quality_review_retranslations: int = 0
     quality_review_retranslations_rejected: int = 0
@@ -599,6 +601,221 @@ def make_translation_cache_key(
         ensure_ascii=False,
         sort_keys=True,
     )
+
+
+
+@dataclass(frozen=True)
+class TranslationCacheCandidate:
+    cache_key: str
+    translation: str
+    metadata: Dict[str, Any]
+    model_quality: Tuple[float, int]
+    insertion_order: int
+
+
+TranslationCacheIndex = Dict[
+    Tuple[str, str, str, str, bool, int],
+    List[TranslationCacheCandidate],
+]
+
+
+def parse_translation_cache_key(cache_key: str) -> Optional[Dict[str, Any]]:
+    """
+    Parse a serialized cache key.
+
+    Invalid or legacy keys that are not JSON objects are ignored by the
+    model-aware fallback logic, but they remain untouched in the cache file.
+    """
+    try:
+        metadata = json.loads(cache_key)
+    except (TypeError, json.JSONDecodeError):
+        return None
+
+    if not isinstance(metadata, dict):
+        return None
+    if not isinstance(metadata.get("source_text"), str):
+        return None
+    return metadata
+
+
+def model_quality_from_hint(model_hint: str) -> Optional[Tuple[float, int]]:
+    """
+    Infer a comparable model-quality score from names such as
+    'nllb-200-distilled-1.3B' and 'nllb-200-3.3B'.
+
+    The first tuple element is the approximate parameter count in billions.
+    For equal parameter counts, a non-distilled model ranks above a distilled
+    one. Unknown model sizes are deliberately not compared.
+    """
+    normalized_hint = model_hint.lower()
+    sizes_in_billions: List[float] = []
+
+    for raw_size, raw_unit in re.findall(
+        r"(?<![\d.])(\d+(?:\.\d+)?)\s*([bm])\b",
+        normalized_hint,
+        flags=re.IGNORECASE,
+    ):
+        size = float(raw_size)
+        if raw_unit.lower() == "m":
+            size /= 1000.0
+        sizes_in_billions.append(size)
+
+    if not sizes_in_billions:
+        return None
+
+    non_distilled_bonus = 0 if "distilled" in normalized_hint else 1
+    return max(sizes_in_billions), non_distilled_bonus
+
+
+def model_quality_from_cache_metadata(
+    metadata: Dict[str, Any],
+) -> Optional[Tuple[float, int]]:
+    model_hint = " ".join(
+        str(metadata.get(field, ""))
+        for field in ("tokenizer_model", "ct2_model_dir")
+    )
+    return model_quality_from_hint(model_hint)
+
+
+def model_quality_from_backend(
+    backend: Ct2TranslatorBackend,
+) -> Optional[Tuple[float, int]]:
+    return model_quality_from_hint(
+        f"{backend.tokenizer_model} {backend.ct2_model_dir}"
+    )
+
+
+def cache_compatibility_identity(
+    *,
+    source_text: str,
+    source_lang_code: str,
+    target_lang_code: str,
+    model_family: str,
+    preserve_special_symbols: bool,
+    symbol_protection_version: int = 1,
+) -> Tuple[str, str, str, str, bool, int]:
+    """
+    Fields that must agree before one model's cached translation may substitute
+    for another model's result.
+
+    Beam size and token limits are generation settings and are not part of this
+    identity. Language direction, model family and symbol handling must match.
+    """
+    return (
+        source_text,
+        source_lang_code,
+        target_lang_code,
+        model_family,
+        preserve_special_symbols,
+        symbol_protection_version,
+    )
+
+
+def build_translation_cache_index(
+    cache: Dict[str, str],
+) -> TranslationCacheIndex:
+    index: TranslationCacheIndex = defaultdict(list)
+
+    for insertion_order, (cache_key, translation) in enumerate(cache.items()):
+        metadata = parse_translation_cache_key(cache_key)
+        if metadata is None:
+            continue
+
+        quality = model_quality_from_cache_metadata(metadata)
+        if quality is None:
+            continue
+
+        source_text = metadata.get("source_text")
+        source_lang_code = metadata.get("source_lang_code")
+        target_lang_code = metadata.get("target_lang_code")
+        model_family = metadata.get("model_family")
+        preserve_special_symbols = metadata.get("preserve_special_symbols")
+        symbol_protection_version = metadata.get("symbol_protection_version", 1)
+
+        if not all(
+            isinstance(value, str)
+            for value in (
+                source_text,
+                source_lang_code,
+                target_lang_code,
+                model_family,
+            )
+        ):
+            continue
+        if not isinstance(preserve_special_symbols, bool):
+            continue
+        if not isinstance(symbol_protection_version, int):
+            continue
+
+        identity = cache_compatibility_identity(
+            source_text=source_text,
+            source_lang_code=source_lang_code,
+            target_lang_code=target_lang_code,
+            model_family=model_family,
+            preserve_special_symbols=preserve_special_symbols,
+            symbol_protection_version=symbol_protection_version,
+        )
+        index[identity].append(
+            TranslationCacheCandidate(
+                cache_key=cache_key,
+                translation=translation,
+                metadata=metadata,
+                model_quality=quality,
+                insertion_order=insertion_order,
+            )
+        )
+
+    return index
+
+
+def find_higher_quality_cached_translation(
+    text: str,
+    backend: Ct2TranslatorBackend,
+    cache_index: TranslationCacheIndex,
+) -> Optional[TranslationCacheCandidate]:
+    """
+    Return the best compatible cached translation produced by a model that is
+    strictly stronger than the currently selected backend.
+
+    This lookup runs before the exact current-model cache lookup. Consequently,
+    an existing weak-model cache entry cannot hide a stronger cached result.
+    """
+    current_quality = model_quality_from_backend(backend)
+    if current_quality is None:
+        return None
+
+    identity = cache_compatibility_identity(
+        source_text=text,
+        source_lang_code=backend.source_lang_code,
+        target_lang_code=backend.target_lang_code,
+        model_family=backend.model_family,
+        preserve_special_symbols=backend.preserve_special_symbols,
+    )
+
+    stronger_candidates = [
+        candidate
+        for candidate in cache_index.get(identity, [])
+        if candidate.model_quality > current_quality
+        and isinstance(candidate.translation, str)
+        and candidate.translation != ""
+    ]
+    if not stronger_candidates:
+        return None
+
+    def candidate_priority(
+        candidate: TranslationCacheCandidate,
+    ) -> Tuple[Tuple[float, int], int, int, int]:
+        metadata = candidate.metadata
+        beam_size = metadata.get("beam_size")
+        max_input_tokens = metadata.get("max_input_tokens")
+        return (
+            candidate.model_quality,
+            beam_size if isinstance(beam_size, int) else 0,
+            max_input_tokens if isinstance(max_input_tokens, int) else 0,
+            candidate.insertion_order,
+        )
+
+    return max(stronger_candidates, key=candidate_priority)
 
 
 def resolve_ct2_model_family(
@@ -1105,12 +1322,36 @@ def get_backend_translations_with_cache(
     *,
     cached_stat: Optional[str],
     generated_stat: Optional[str],
+    higher_quality_cached_stat: Optional[str] = None,
+    prefer_higher_quality_cache: bool = True,
 ) -> Dict[str, str]:
     translated_by_text: Dict[str, str] = {}
     texts_to_translate: List[str] = []
     seen_missing: set[str] = set()
+    cache_index = (
+        build_translation_cache_index(cache)
+        if prefer_higher_quality_cache
+        else {}
+    )
 
     for text in texts:
+        stronger_candidate = (
+            find_higher_quality_cached_translation(text, backend, cache_index)
+            if prefer_higher_quality_cache
+            else None
+        )
+        if stronger_candidate is not None:
+            translated_by_text[text] = stronger_candidate.translation
+            if cached_stat:
+                setattr(stats, cached_stat, getattr(stats, cached_stat) + 1)
+            if higher_quality_cached_stat:
+                setattr(
+                    stats,
+                    higher_quality_cached_stat,
+                    getattr(stats, higher_quality_cached_stat) + 1,
+                )
+            continue
+
         cache_key = make_translation_cache_key(text, backend)
         if cache_key in cache:
             translated_by_text[text] = cache[cache_key]
@@ -1133,7 +1374,6 @@ def get_backend_translations_with_cache(
             setattr(stats, generated_stat, getattr(stats, generated_stat) + len(batch))
 
     return translated_by_text
-
 
 def quality_review_retranslations(
     texts: List[str],
@@ -1194,6 +1434,7 @@ def quality_review_retranslations(
                 stats,
                 cached_stat=None,
                 generated_stat=None,
+                prefer_higher_quality_cache=args.prefer_higher_quality_cache,
             )
             stats.round_trip_checks += len(roundtrip_sources)
             for source_text in roundtrip_sources:
@@ -1229,6 +1470,10 @@ def quality_review_retranslations(
         stats,
         cached_stat="quality_review_cached_translations_used",
         generated_stat="quality_review_newly_generated_translations",
+        higher_quality_cached_stat=(
+            "quality_review_higher_quality_cached_translations_used"
+        ),
+        prefer_higher_quality_cache=args.prefer_higher_quality_cache,
     )
 
     reviewed_translated_by_text = dict(translated_by_text)
@@ -1407,6 +1652,11 @@ def get_cached_or_translate_texts(
     texts_to_translate: List[str] = []
     reviewable_texts: List[str] = []
     seen_missing: set[str] = set()
+    cache_index = (
+        build_translation_cache_index(cache)
+        if args.prefer_higher_quality_cache
+        else {}
+    )
 
     for text in texts:
         exact_override = exact_glossary_override(text, glossary)
@@ -1416,6 +1666,23 @@ def get_cached_or_translate_texts(
             continue
 
         reviewable_texts.append(text)
+
+        stronger_candidate = (
+            find_higher_quality_cached_translation(text, backend, cache_index)
+            if args.prefer_higher_quality_cache
+            else None
+        )
+        if stronger_candidate is not None:
+            translated_text, replacement_count = apply_glossary_postprocessing(
+                stronger_candidate.translation,
+                glossary,
+            )
+            translated_by_text[text] = translated_text
+            stats.cached_translations_used += 1
+            stats.higher_quality_cached_translations_used += 1
+            stats.glossary_post_replacements += replacement_count
+            continue
+
         cache_key = make_translation_cache_key(
             text,
             backend,
@@ -1548,6 +1815,10 @@ def translate_targets_with_ct2(
 
     save_translation_cache(cache)
     print(f"Cached translations used: {stats.cached_translations_used}")
+    print(
+        "Higher-quality cached translations preferred: "
+        f"{stats.higher_quality_cached_translations_used}"
+    )
     print(f"Newly generated translations: {stats.newly_generated_translations}")
     print(f"Glossary exact overrides: {stats.glossary_exact_overrides}")
     print(f"Glossary post-processing replacements: {stats.glossary_post_replacements}")
@@ -1558,6 +1829,10 @@ def translate_targets_with_ct2(
     print(
         "Quality-review cached translations used: "
         f"{stats.quality_review_cached_translations_used}"
+    )
+    print(
+        "Quality-review higher-quality cached translations preferred: "
+        f"{stats.quality_review_higher_quality_cached_translations_used}"
     )
     print(
         "Quality-review newly generated translations: "
@@ -2366,6 +2641,10 @@ def print_run_summary(report: SyncReport) -> None:
     print(f"Stale clone items deleted: {report.stale_clone_items_deleted}")
     print(f"Unsupported items skipped: {report.unsupported_items_skipped}")
     print(f"Cached translations used: {report.cached_translations_used}")
+    print(
+        "Higher-quality cached translations preferred: "
+        f"{report.higher_quality_cached_translations_used}"
+    )
     print(f"Newly generated translations: {report.newly_generated_translations}")
     print(f"Glossary exact overrides: {report.glossary_exact_overrides}")
     print(f"Glossary post-processing replacements: {report.glossary_post_replacements}")
@@ -2376,6 +2655,10 @@ def print_run_summary(report: SyncReport) -> None:
     print(
         "Quality-review cached translations used: "
         f"{report.quality_review_cached_translations_used}"
+    )
+    print(
+        "Quality-review higher-quality cached translations preferred: "
+        f"{report.quality_review_higher_quality_cached_translations_used}"
     )
     print(
         "Quality-review newly generated translations: "
@@ -2395,6 +2678,9 @@ def update_report_from_translation_stats(
     stats: TranslationStats,
 ) -> None:
     report.cached_translations_used = stats.cached_translations_used
+    report.higher_quality_cached_translations_used = (
+        stats.higher_quality_cached_translations_used
+    )
     report.newly_generated_translations = stats.newly_generated_translations
     report.glossary_exact_overrides = stats.glossary_exact_overrides
     report.glossary_post_replacements = stats.glossary_post_replacements
@@ -2404,6 +2690,9 @@ def update_report_from_translation_stats(
     report.quality_review_candidates = stats.quality_review_candidates
     report.quality_review_cached_translations_used = (
         stats.quality_review_cached_translations_used
+    )
+    report.quality_review_higher_quality_cached_translations_used = (
+        stats.quality_review_higher_quality_cached_translations_used
     )
     report.quality_review_newly_generated_translations = (
         stats.quality_review_newly_generated_translations
@@ -2967,6 +3256,17 @@ def main() -> int:
         help=(
             "Protect emojis, pictograms, dingbats, and similar symbols from the "
             "translator and reinsert them unchanged. Default: true."
+        ),
+    )
+    parser.add_argument(
+        "--prefer-higher-quality-cache",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Reuse a compatible cache entry produced by a strictly stronger "
+            "model before translating with the selected backend. A cached NLLB "
+            "3.3B result therefore takes precedence over generation and over an "
+            "older exact NLLB 1.3B cache entry. Default: true."
         ),
     )
     parser.add_argument(
