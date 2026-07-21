@@ -3751,7 +3751,7 @@ def main() -> int:
     parser.add_argument(
         "--translation-batch-size",
         type=int,
-        default=16,
+        default=64,
         help="Number of plain text units translated per CTranslate2 batch. Default: 16.",
     )
     parser.add_argument(
