@@ -2423,9 +2423,16 @@ def update_sync_state_entry_hashes(
     clone_item_id: str,
     translated_fields: Dict[str, str],
 ) -> None:
-    translated_hashes = {
-        field: hash_text(value) for field, value in translated_fields.items()
-    }
+    existing_entry = state.get("items", {}).get(source_item["id"]) or {}
+    translated_hashes = dict(
+        existing_entry.get("last_translated_text_hash_by_field") or {}
+    )
+    translated_hashes.update(
+        {
+            field: hash_text(value)
+            for field, value in translated_fields.items()
+        }
+    )
     state["items"][source_item["id"]] = sync_state_entry_for_item(
         source_item,
         clone_item_id,
@@ -2566,15 +2573,36 @@ def apply_translations_to_miro(
     for (item_id, item_type, field), translated_text in translations.items():
         grouped[(item_id, item_type)][field] = translated_text
 
-    print(f"Updating {len(grouped)} Miro items...")
+    total = len(grouped)
+    print(f"Translation phase complete. Updating {total} Miro items...", flush=True)
 
     updated = 0
-    for (item_id, item_type), data_update in grouped.items():
+    started_at = time.monotonic()
+
+    for planned_index, ((item_id, item_type), data_update) in enumerate(
+        grouped.items(),
+        start=1,
+    ):
         if item_type not in MIRO_UPDATE_ENDPOINTS:
             continue
 
+        if (
+            planned_index == 1
+            or planned_index % 10 == 0
+            or planned_index == total
+        ):
+            elapsed = time.monotonic() - started_at
+            print(
+                f"  Starting item {planned_index}/{total} "
+                f"({item_type}); elapsed {elapsed:.1f}s",
+                flush=True,
+            )
+
         if dry_run:
-            print(f"[DRY RUN] Would update {item_type} {item_id}: {list(data_update)}")
+            print(
+                f"[DRY RUN] Would update {item_type} {item_id}: "
+                f"{list(data_update)}"
+            )
             updated += 1
             continue
 
@@ -2587,8 +2615,16 @@ def apply_translations_to_miro(
         )
         updated += 1
 
-        if updated % 25 == 0:
-            print(f"  {updated}/{len(grouped)} items updated")
+        if updated % 10 == 0 or updated == total:
+            elapsed = time.monotonic() - started_at
+            rate = updated / elapsed if elapsed > 0 else 0.0
+            remaining = total - updated
+            eta = remaining / rate if rate > 0 else 0.0
+            print(
+                f"  {updated}/{total} items updated "
+                f"({rate:.2f}/s, ETA {eta:.0f}s)",
+                flush=True,
+            )
 
     return updated
 
@@ -2845,13 +2881,33 @@ def build_update_translation_targets(
     source_items: List[Dict[str, Any]],
     clone_items: List[Dict[str, Any]],
     sync_state: Dict[str, Any],
-) -> Tuple[List[TranslationTarget], List[Tuple[Dict[str, Any], str]], List[Dict[str, Any]], List[str]]:
+    *,
+    update_layout: bool,
+) -> Tuple[
+    List[TranslationTarget],
+    List[Tuple[Dict[str, Any], str]],
+    List[Dict[str, Any]],
+    List[str],
+    int,
+]:
+    """
+    Build the incremental update plan.
+
+    In the default text-only mode, mapped items are scheduled only when at least
+    one translatable source field changed since the last successful sync.
+    Previously every mapped item was PATCHed again, which could make the program
+    appear frozen for a long time after translation had already finished.
+
+    With --update-layout, all mapped items remain scheduled because the current
+    sync-state format does not yet store layout hashes.
+    """
     source_lookup = item_by_id(source_items)
     clone_lookup = item_by_id(clone_items)
 
     targets: List[TranslationTarget] = []
-    mapped_items: List[Tuple[Dict[str, Any], str]] = []
+    mapped_items_to_update: List[Tuple[Dict[str, Any], str]] = []
     stale_source_ids: List[str] = []
+    unchanged_mapped_items = 0
 
     for source_item_id, entry in sync_state.get("items", {}).items():
         source_item = source_lookup.get(source_item_id)
@@ -2869,12 +2925,29 @@ def build_update_translation_targets(
         if not supported_item(source_item):
             continue
 
-        mapped_items.append((source_item, clone_item_id))
         data = source_item.get("data") or {}
         item_type = source_item.get("type")
+        previous_hashes = entry.get("last_source_text_hash_by_field") or {}
+
+        changed_fields: List[Tuple[str, str]] = []
+        all_translatable_fields: List[Tuple[str, str]] = []
+
         for field in TRANSLATABLE_FIELDS.get(item_type, []):
             value = data.get(field)
-            if isinstance(value, str) and is_probably_translatable(value):
+            if not isinstance(value, str) or not is_probably_translatable(value):
+                continue
+
+            all_translatable_fields.append((field, value))
+            if previous_hashes.get(field) != hash_text(value):
+                changed_fields.append((field, value))
+
+        fields_to_translate = (
+            all_translatable_fields if update_layout else changed_fields
+        )
+
+        if update_layout or changed_fields:
+            mapped_items_to_update.append((source_item, clone_item_id))
+            for field, value in fields_to_translate:
                 targets.append(
                     TranslationTarget(
                         item_id=clone_item_id,
@@ -2884,6 +2957,8 @@ def build_update_translation_targets(
                         is_html=looks_like_html(value),
                     )
                 )
+        else:
+            unchanged_mapped_items += 1
 
     mapped_source_ids = set(sync_state.get("items", {}).keys())
     new_source_items = [
@@ -2898,6 +2973,7 @@ def build_update_translation_targets(
         source_item_id = source_item.get("id")
         if not source_item_id:
             continue
+
         for field in TRANSLATABLE_FIELDS.get(item_type, []):
             value = data.get(field)
             if isinstance(value, str) and is_probably_translatable(value):
@@ -2911,8 +2987,13 @@ def build_update_translation_targets(
                     )
                 )
 
-    return targets, mapped_items, new_source_items, stale_source_ids
-
+    return (
+        targets,
+        mapped_items_to_update,
+        new_source_items,
+        stale_source_ids,
+        unchanged_mapped_items,
+    )
 
 def run_update_existing_clone_mode(
     args: argparse.Namespace,
@@ -2980,13 +3061,33 @@ def run_update_existing_clone_mode(
     if sync_state.get("clone_board_id") != clone_board_id:
         raise ValueError("Sync-state clone_board_id does not match --clone-board")
 
-    targets, mapped_items, new_source_items, stale_source_ids = (
-        build_update_translation_targets(source_items, clone_items, sync_state)
+    (
+        targets,
+        mapped_items,
+        new_source_items,
+        stale_source_ids,
+        unchanged_mapped_items,
+    ) = build_update_translation_targets(
+        source_items,
+        clone_items,
+        sync_state,
+        update_layout=args.update_layout,
     )
     report.translatable_source_fields = len(targets)
     report.stale_clone_items_detected = len(stale_source_ids)
 
     print_item_counts(targets)
+    if not args.update_layout:
+        print(
+            "Unchanged mapped items skipped: "
+            f"{unchanged_mapped_items}",
+            flush=True,
+        )
+    print(
+        "Mapped items scheduled for Miro update: "
+        f"{len(mapped_items)}",
+        flush=True,
+    )
     if stale_source_ids:
         print(f"Stale mapped source items detected: {len(stale_source_ids)}")
     if new_source_items:
@@ -3007,10 +3108,35 @@ def run_update_existing_clone_mode(
     else:
         translations = {}
 
-    for source_item, clone_item_id in mapped_items:
+    mapped_total = len(mapped_items)
+    if mapped_total:
+        print(
+            f"Translation phase complete. Updating {mapped_total} mapped "
+            "Miro items...",
+            flush=True,
+        )
+
+    mapped_update_started_at = time.monotonic()
+    for mapped_index, (source_item, clone_item_id) in enumerate(
+        mapped_items,
+        start=1,
+    ):
+        item_type = source_item.get("type")
+        if (
+            mapped_index == 1
+            or mapped_index % 10 == 0
+            or mapped_index == mapped_total
+        ):
+            elapsed = time.monotonic() - mapped_update_started_at
+            print(
+                f"  Starting mapped item {mapped_index}/{mapped_total} "
+                f"({item_type}); elapsed {elapsed:.1f}s",
+                flush=True,
+            )
+
         translated_fields = translated_fields_for_item(
             clone_item_id,
-            source_item.get("type"),
+            item_type,
             translations,
         )
         if update_clone_item_from_source_item(
@@ -3031,7 +3157,32 @@ def run_update_existing_clone_mode(
                     translated_fields,
                 )
 
-    for source_item in new_source_items:
+        if (
+            mapped_index % 10 == 0
+            or mapped_index == mapped_total
+        ):
+            elapsed = time.monotonic() - mapped_update_started_at
+            rate = mapped_index / elapsed if elapsed > 0 else 0.0
+            remaining = mapped_total - mapped_index
+            eta = remaining / rate if rate > 0 else 0.0
+            print(
+                f"  {mapped_index}/{mapped_total} mapped items processed "
+                f"({rate:.2f}/s, ETA {eta:.0f}s)",
+                flush=True,
+            )
+
+    new_total = len(new_source_items)
+    if new_total:
+        print(f"Creating {new_total} new clone items...", flush=True)
+
+    for new_index, source_item in enumerate(new_source_items, start=1):
+        if new_index == 1 or new_index % 10 == 0 or new_index == new_total:
+            print(
+                f"  Creating new item {new_index}/{new_total} "
+                f"({source_item.get('type')})",
+                flush=True,
+            )
+
         source_item_id = source_item.get("id")
         translated_fields = translated_fields_for_item(
             source_item_id,
