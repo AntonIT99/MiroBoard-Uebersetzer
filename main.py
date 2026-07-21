@@ -115,6 +115,7 @@ class SyncReport:
     updated_miro_items: int = 0
     cached_translations_used: int = 0
     higher_quality_cached_translations_used: int = 0
+    manually_imported_clone_translations: int = 0
     newly_generated_translations: int = 0
     glossary_exact_overrides: int = 0
     glossary_post_replacements: int = 0
@@ -516,6 +517,7 @@ def create_quality_review_ct2_backend(args: argparse.Namespace) -> Ct2Translator
 class TranslationStats:
     cached_translations_used: int = 0
     higher_quality_cached_translations_used: int = 0
+    manually_imported_clone_translations: int = 0
     newly_generated_translations: int = 0
     completed_fields: int = 0
     glossary_exact_overrides: int = 0
@@ -2681,6 +2683,10 @@ def print_run_summary(report: SyncReport) -> None:
         "Higher-quality cached translations preferred: "
         f"{report.higher_quality_cached_translations_used}"
     )
+    print(
+        "Manual clone translations imported into cache: "
+        f"{report.manually_imported_clone_translations}"
+    )
     print(f"Newly generated translations: {report.newly_generated_translations}")
     print(f"Glossary exact overrides: {report.glossary_exact_overrides}")
     print(f"Glossary post-processing replacements: {report.glossary_post_replacements}")
@@ -2891,23 +2897,29 @@ def build_update_translation_targets(
     int,
 ]:
     """
-    Build the incremental update plan.
+    Build the update plan.
 
-    In the default text-only mode, mapped items are scheduled only when at least
-    one translatable source field changed since the last successful sync.
-    Previously every mapped item was PATCHed again, which could make the program
-    appear frozen for a long time after translation had already finished.
+    Every mapped translatable source field is resolved through the cache again,
+    even when the source text itself is unchanged. This is required because the
+    desired translation can change independently of the source text, for
+    example after:
 
-    With --update-layout, all mapped items remain scheduled because the current
-    sync-state format does not yet store layout hashes.
+      * replacing the translation model,
+      * adding a stronger-model cache entry,
+      * manually correcting the cache, or
+      * changing the glossary.
+
+    Network writes are filtered later by comparing the resolved translation
+    against the text currently present on the clone board. Therefore, unchanged
+    clone items still incur no PATCH request.
     """
     source_lookup = item_by_id(source_items)
     clone_lookup = item_by_id(clone_items)
 
     targets: List[TranslationTarget] = []
-    mapped_items_to_update: List[Tuple[Dict[str, Any], str]] = []
+    mapped_items: List[Tuple[Dict[str, Any], str]] = []
     stale_source_ids: List[str] = []
-    unchanged_mapped_items = 0
+    mapped_items_with_unchanged_source = 0
 
     for source_item_id, entry in sync_state.get("items", {}).items():
         source_item = source_lookup.get(source_item_id)
@@ -2929,36 +2941,35 @@ def build_update_translation_targets(
         item_type = source_item.get("type")
         previous_hashes = entry.get("last_source_text_hash_by_field") or {}
 
-        changed_fields: List[Tuple[str, str]] = []
-        all_translatable_fields: List[Tuple[str, str]] = []
+        translatable_fields: List[Tuple[str, str]] = []
+        source_changed = False
 
         for field in TRANSLATABLE_FIELDS.get(item_type, []):
             value = data.get(field)
             if not isinstance(value, str) or not is_probably_translatable(value):
                 continue
 
-            all_translatable_fields.append((field, value))
+            translatable_fields.append((field, value))
             if previous_hashes.get(field) != hash_text(value):
-                changed_fields.append((field, value))
+                source_changed = True
 
-        fields_to_translate = (
-            all_translatable_fields if update_layout else changed_fields
-        )
+        # Layout-only items still need scheduling with --update-layout.
+        if translatable_fields or update_layout:
+            mapped_items.append((source_item, clone_item_id))
 
-        if update_layout or changed_fields:
-            mapped_items_to_update.append((source_item, clone_item_id))
-            for field, value in fields_to_translate:
-                targets.append(
-                    TranslationTarget(
-                        item_id=clone_item_id,
-                        item_type=item_type,
-                        field=field,
-                        source_text=value,
-                        is_html=looks_like_html(value),
-                    )
+        if translatable_fields and not source_changed:
+            mapped_items_with_unchanged_source += 1
+
+        for field, value in translatable_fields:
+            targets.append(
+                TranslationTarget(
+                    item_id=clone_item_id,
+                    item_type=item_type,
+                    field=field,
+                    source_text=value,
+                    is_html=looks_like_html(value),
                 )
-        else:
-            unchanged_mapped_items += 1
+            )
 
     mapped_source_ids = set(sync_state.get("items", {}).keys())
     new_source_items = [
@@ -2989,11 +3000,230 @@ def build_update_translation_targets(
 
     return (
         targets,
-        mapped_items_to_update,
+        mapped_items,
         new_source_items,
         stale_source_ids,
-        unchanged_mapped_items,
+        mapped_items_with_unchanged_source,
     )
+
+
+def translated_fields_needing_text_update(
+    clone_item: Dict[str, Any],
+    item_type: str,
+    desired_fields: Dict[str, str],
+) -> Dict[str, str]:
+    """
+    Return only translated fields whose desired value differs from the value
+    currently stored on the clone board.
+    """
+    clone_data = clone_item.get("data") or {}
+    return {
+        field: desired_text
+        for field, desired_text in desired_fields.items()
+        if clone_data.get(field) != desired_text
+    }
+
+
+def make_quality_review_cache_backend(
+    args: argparse.Namespace,
+) -> Ct2TranslatorBackend:
+    """Build review-backend metadata without loading the model."""
+    return Ct2TranslatorBackend(
+        translator=None,
+        tokenizer=None,
+        tokenizer_model=args.quality_review_hf_tokenizer_model,
+        ct2_model_dir=args.quality_review_ct2_model_dir,
+        model_family=resolve_ct2_model_family(
+            args.quality_review_ct2_model_family,
+            args.quality_review_hf_tokenizer_model,
+            args.quality_review_ct2_model_dir,
+        ),
+        source_lang_code=args.source_lang_code,
+        target_lang_code=args.target_lang_code,
+        beam_size=args.quality_review_beam_size,
+        batch_size=args.quality_review_batch_size,
+        max_input_tokens=args.quality_review_max_input_tokens,
+        preserve_special_symbols=args.preserve_special_symbols,
+    )
+
+
+def cache_units_from_manual_clone_field(
+    source_text: str,
+    clone_text: str,
+) -> Optional[List[Tuple[str, str]]]:
+    """
+    Return source/cache-unit pairs for a manually edited clone field.
+
+    Plain fields produce one pair. HTML fields are paired by text-node order and
+    are skipped when the source and clone structures do not match safely.
+    """
+    if not looks_like_html(source_text):
+        return [(source_text, clone_text)]
+
+    BeautifulSoup, NavigableString = import_beautifulsoup()
+    source_soup = BeautifulSoup(source_text, "html.parser")
+    clone_soup = BeautifulSoup(clone_text, "html.parser")
+
+    def units(soup: Any, source_side: bool) -> List[str]:
+        result: List[str] = []
+        for node in soup.find_all(string=True):
+            if not isinstance(node, NavigableString):
+                continue
+            _, core_text, _ = split_surrounding_whitespace(str(node))
+            if not core_text:
+                continue
+            if source_side and not is_probably_translatable(core_text):
+                continue
+            result.append(core_text)
+        return result
+
+    source_units = units(source_soup, True)
+    clone_units = units(clone_soup, False)
+    if len(source_units) != len(clone_units):
+        return None
+    return list(zip(source_units, clone_units))
+
+
+def update_all_compatible_cache_entries(
+    cache: Dict[str, str],
+    *,
+    source_text: str,
+    manual_translation: str,
+    primary_backend: Ct2TranslatorBackend,
+    review_backend: Ct2TranslatorBackend,
+) -> int:
+    """
+    Store one manual translation under current primary/review keys and every
+    compatible historical key. This prevents a stronger old cache entry from
+    overriding the manual edit on the next run.
+    """
+    identity = cache_compatibility_identity(
+        source_text=source_text,
+        source_lang_code=primary_backend.source_lang_code,
+        target_lang_code=primary_backend.target_lang_code,
+        model_family=primary_backend.model_family,
+        preserve_special_symbols=primary_backend.preserve_special_symbols,
+    )
+
+    keys_to_update: set[str] = {
+        make_translation_cache_key(source_text, primary_backend),
+        make_translation_cache_key(source_text, review_backend),
+    }
+
+    for cache_key in list(cache):
+        metadata = parse_translation_cache_key(cache_key)
+        if metadata is None:
+            continue
+        candidate_identity = (
+            metadata.get("source_text"),
+            metadata.get("source_lang_code"),
+            metadata.get("target_lang_code"),
+            metadata.get("model_family"),
+            metadata.get("preserve_special_symbols"),
+            metadata.get("symbol_protection_version", 1),
+        )
+        if candidate_identity == identity:
+            keys_to_update.add(cache_key)
+
+    changed = 0
+    for cache_key in keys_to_update:
+        if cache.get(cache_key) != manual_translation:
+            cache[cache_key] = manual_translation
+            changed += 1
+    return changed
+
+
+def import_manual_clone_translations(
+    *,
+    source_items: List[Dict[str, Any]],
+    clone_items: List[Dict[str, Any]],
+    sync_state: Dict[str, Any],
+    primary_backend: Ct2TranslatorBackend,
+    args: argparse.Namespace,
+) -> Tuple[int, int, int, int]:
+    """
+    Import clone fields that changed since the last successful sync.
+
+    Only fields with a previous translated hash are considered. This prevents a
+    newly initialized or incomplete sync-state from importing the entire clone
+    as if every field had been manually edited.
+    """
+    source_lookup = item_by_id(source_items)
+    clone_lookup = item_by_id(clone_items)
+    review_backend = make_quality_review_cache_backend(args)
+    cache = load_translation_cache()
+
+    imported_fields = 0
+    imported_units = 0
+    skipped_missing_hash = 0
+    skipped_html_mismatch = 0
+
+    for source_item_id, state_entry in sync_state.get("items", {}).items():
+        source_item = source_lookup.get(source_item_id)
+        clone_item_id = state_entry.get("clone_item_id")
+        clone_item = clone_lookup.get(clone_item_id)
+        if not source_item or not clone_item:
+            continue
+
+        item_type = source_item.get("type")
+        source_data = source_item.get("data") or {}
+        clone_data = clone_item.get("data") or {}
+        translated_hashes = dict(
+            state_entry.get("last_translated_text_hash_by_field") or {}
+        )
+
+        for field in TRANSLATABLE_FIELDS.get(item_type, []):
+            source_value = source_data.get(field)
+            clone_value = clone_data.get(field)
+            if (
+                not isinstance(source_value, str)
+                or not isinstance(clone_value, str)
+                or not is_probably_translatable(source_value)
+            ):
+                continue
+
+            previous_hash = translated_hashes.get(field)
+            if not previous_hash:
+                skipped_missing_hash += 1
+                continue
+            if hash_text(clone_value) == previous_hash:
+                continue
+
+            units = cache_units_from_manual_clone_field(source_value, clone_value)
+            if units is None:
+                skipped_html_mismatch += 1
+                print(
+                    "WARNING: Manual HTML translation could not be imported for "
+                    f"{item_type} {clone_item_id} field {field}: text-node counts "
+                    "do not match.",
+                    file=sys.stderr,
+                )
+                continue
+
+            for source_unit, manual_translation in units:
+                update_all_compatible_cache_entries(
+                    cache,
+                    source_text=source_unit,
+                    manual_translation=manual_translation,
+                    primary_backend=primary_backend,
+                    review_backend=review_backend,
+                )
+                imported_units += 1
+
+            translated_hashes[field] = hash_text(clone_value)
+            state_entry["last_translated_text_hash_by_field"] = translated_hashes
+            imported_fields += 1
+
+    if imported_fields:
+        save_translation_cache(cache)
+
+    return (
+        imported_fields,
+        imported_units,
+        skipped_missing_hash,
+        skipped_html_mismatch,
+    )
+
 
 def run_update_existing_clone_mode(
     args: argparse.Namespace,
@@ -3061,12 +3291,54 @@ def run_update_existing_clone_mode(
     if sync_state.get("clone_board_id") != clone_board_id:
         raise ValueError("Sync-state clone_board_id does not match --clone-board")
 
+    if args.import_manual_clone_translations:
+        print(
+            "Importing manual translation changes from the clone into the cache...",
+            flush=True,
+        )
+        (
+            imported_fields,
+            imported_units,
+            skipped_missing_hash,
+            skipped_html_mismatch,
+        ) = import_manual_clone_translations(
+            source_items=source_items,
+            clone_items=clone_items,
+            sync_state=sync_state,
+            primary_backend=translation_backend,
+            args=args,
+        )
+        report.manually_imported_clone_translations = imported_fields
+        print(
+            f"Manual clone fields imported: {imported_fields} "
+            f"({imported_units} cache text units)",
+            flush=True,
+        )
+        if skipped_missing_hash:
+            print(
+                "Fields not imported because no previous translated hash was "
+                f"available: {skipped_missing_hash}",
+                flush=True,
+            )
+        if skipped_html_mismatch:
+            print(
+                "Manual HTML fields skipped because their source/clone text-node "
+                f"structures differed: {skipped_html_mismatch}",
+                flush=True,
+            )
+        if imported_fields and not args.dry_run:
+            save_sync_state(sync_state_path, sync_state)
+            print(
+                f"Updated sync-state after manual import: {sync_state_path}",
+                flush=True,
+            )
+
     (
         targets,
         mapped_items,
         new_source_items,
         stale_source_ids,
-        unchanged_mapped_items,
+        mapped_items_with_unchanged_source,
     ) = build_update_translation_targets(
         source_items,
         clone_items,
@@ -3079,12 +3351,17 @@ def run_update_existing_clone_mode(
     print_item_counts(targets)
     if not args.update_layout:
         print(
-            "Unchanged mapped items skipped: "
-            f"{unchanged_mapped_items}",
+            "Mapped items with unchanged source text: "
+            f"{mapped_items_with_unchanged_source}",
+            flush=True,
+        )
+        print(
+            "Their cached/desired translations will still be checked against "
+            "the clone; only actual differences will be written.",
             flush=True,
         )
     print(
-        "Mapped items scheduled for Miro update: "
+        "Mapped items whose translations will be checked: "
         f"{len(mapped_items)}",
         flush=True,
     )
@@ -3108,17 +3385,94 @@ def run_update_existing_clone_mode(
     else:
         translations = {}
 
-    mapped_total = len(mapped_items)
+    clone_lookup = item_by_id(clone_items)
+    mapped_updates: List[
+        Tuple[Dict[str, Any], str, Dict[str, str]]
+    ] = []
+    mapped_items_already_current = 0
+    mapped_items_without_translatable_text = 0
+
+    print(
+        "Comparing resolved translations with the current clone text...",
+        flush=True,
+    )
+
+    for source_item, clone_item_id in mapped_items:
+        item_type = source_item.get("type")
+        desired_fields = translated_fields_for_item(
+            clone_item_id,
+            item_type,
+            translations,
+        )
+
+        if args.update_layout:
+            # Layout synchronization intentionally processes every mapped item.
+            mapped_updates.append(
+                (source_item, clone_item_id, desired_fields)
+            )
+            continue
+
+        if not desired_fields:
+            mapped_items_without_translatable_text += 1
+            continue
+
+        clone_item = clone_lookup.get(clone_item_id)
+        if clone_item is None:
+            continue
+
+        fields_to_update = translated_fields_needing_text_update(
+            clone_item,
+            item_type,
+            desired_fields,
+        )
+
+        if fields_to_update:
+            mapped_updates.append(
+                (source_item, clone_item_id, fields_to_update)
+            )
+        else:
+            mapped_items_already_current += 1
+            if not args.dry_run:
+                # The clone already contains the desired result, so recording
+                # the current hashes is safe without issuing a network write.
+                update_sync_state_entry_hashes(
+                    sync_state,
+                    source_item,
+                    clone_item_id,
+                    desired_fields,
+                )
+
+    print(
+        "Mapped items already matching the desired translation: "
+        f"{mapped_items_already_current}",
+        flush=True,
+    )
+    if mapped_items_without_translatable_text:
+        print(
+            "Mapped items without translatable text: "
+            f"{mapped_items_without_translatable_text}",
+            flush=True,
+        )
+    print(
+        "Mapped items requiring a Miro text update: "
+        f"{len(mapped_updates)}",
+        flush=True,
+    )
+
+    mapped_total = len(mapped_updates)
     if mapped_total:
         print(
-            f"Translation phase complete. Updating {mapped_total} mapped "
-            "Miro items...",
+            f"Updating {mapped_total} mapped Miro items...",
             flush=True,
         )
 
     mapped_update_started_at = time.monotonic()
-    for mapped_index, (source_item, clone_item_id) in enumerate(
-        mapped_items,
+    for mapped_index, (
+        source_item,
+        clone_item_id,
+        translated_fields,
+    ) in enumerate(
+        mapped_updates,
         start=1,
     ):
         item_type = source_item.get("type")
@@ -3134,11 +3488,6 @@ def run_update_existing_clone_mode(
                 flush=True,
             )
 
-        translated_fields = translated_fields_for_item(
-            clone_item_id,
-            item_type,
-            translations,
-        )
         if update_clone_item_from_source_item(
             miro_token,
             clone_board_id,
@@ -3150,17 +3499,22 @@ def run_update_existing_clone_mode(
         ):
             report.mapped_items_updated += 1
             if not args.dry_run:
+                # Hash all desired fields, not just the subset sent in this
+                # PATCH, so the sync-state remains complete for multi-field
+                # items such as cards.
+                all_desired_fields = translated_fields_for_item(
+                    clone_item_id,
+                    item_type,
+                    translations,
+                )
                 update_sync_state_entry_hashes(
                     sync_state,
                     source_item,
                     clone_item_id,
-                    translated_fields,
+                    all_desired_fields,
                 )
 
-        if (
-            mapped_index % 10 == 0
-            or mapped_index == mapped_total
-        ):
+        if mapped_index % 10 == 0 or mapped_index == mapped_total:
             elapsed = time.monotonic() - mapped_update_started_at
             rate = mapped_index / elapsed if elapsed > 0 else 0.0
             remaining = mapped_total - mapped_index
@@ -3293,6 +3647,18 @@ def main() -> int:
         "--delete-missing-items",
         action="store_true",
         help="Delete mapped clone items whose source items no longer exist.",
+    )
+    parser.add_argument(
+        "--import-manual-clone-translations",
+        action="store_true",
+        help=(
+            "With --update-existing-clone, detect English clone fields manually "
+            "edited since the last successful sync and import them into all "
+            "compatible primary/review cache entries before normal translation "
+            "resolution. The manual clone text therefore wins instead of being "
+            "overwritten. Only fields with a known previous translated hash are "
+            "imported."
+        ),
     )
     parser.add_argument(
         "--update-layout",
